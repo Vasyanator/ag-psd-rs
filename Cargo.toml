@@ -1,0 +1,22 @@
+[package]
+name = "ag-psd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Read and write Adobe Photoshop (.psd/.psb) files — a from-scratch Rust port of the ag-psd TypeScript library."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/Vasyanator/ag-psd"
+homepage = "https://github.com/Vasyanator/ag-psd"
+documentation = "https://docs.rs/ag-psd"
+keywords = ["psd", "photoshop", "image", "parser", "adobe"]
+categories = ["graphics", "multimedia::images", "parser-implementations"]
+authors = ["Vasyanator", "Claude (Anthropic)"]
+exclude = ["tests/", "MODULE_README.md", "docs/"]
+
+[lib]
+name = "ag_psd"
+
+[dependencies]
+# ZIP/RLE channel (de)compression for the reader/writer.
+flate2 = "1"

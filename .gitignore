@@ -1,0 +1,9 @@
+# Rust build artifacts
+/target
+
+# Cargo.lock is not committed for libraries
+Cargo.lock
+
+# Editor / OS junk
+*.swp
+.DS_Store
