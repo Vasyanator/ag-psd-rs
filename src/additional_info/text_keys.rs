@@ -358,7 +358,7 @@ fn decode_warp(desc: &Descriptor) -> ReadResult<Warp> {
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 fn base64_encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     let mut chunks = data.chunks_exact(3);
     for c in &mut chunks {
         let n = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | (c[2] as u32);
@@ -797,8 +797,10 @@ mod tests {
 
     #[test]
     fn roundtrip_tysh_basic() {
-        let mut info = LayerAdditionalInfo::default();
-        info.text = Some(sample_text());
+        let info = LayerAdditionalInfo {
+            text: Some(sample_text()),
+            ..Default::default()
+        };
 
         let out = roundtrip(info);
         let t = out.text.expect("text");
@@ -819,8 +821,10 @@ mod tests {
 
     #[test]
     fn roundtrip_tysh_warp() {
-        let mut info = LayerAdditionalInfo::default();
-        info.text = Some(sample_text());
+        let info = LayerAdditionalInfo {
+            text: Some(sample_text()),
+            ..Default::default()
+        };
 
         let out = roundtrip(info);
         let w = out.text.expect("text").warp.expect("warp");
@@ -831,8 +835,10 @@ mod tests {
 
     #[test]
     fn roundtrip_tysh_units_bounds() {
-        let mut info = LayerAdditionalInfo::default();
-        info.text = Some(sample_text());
+        let info = LayerAdditionalInfo {
+            text: Some(sample_text()),
+            ..Default::default()
+        };
 
         let out = roundtrip(info);
         let b = out.text.expect("text").bounds.expect("bounds");
@@ -843,8 +849,10 @@ mod tests {
 
     #[test]
     fn roundtrip_tysh_style_font() {
-        let mut info = LayerAdditionalInfo::default();
-        info.text = Some(sample_text());
+        let info = LayerAdditionalInfo {
+            text: Some(sample_text()),
+            ..Default::default()
+        };
 
         let out = roundtrip(info);
         let t = out.text.expect("text");
@@ -860,8 +868,10 @@ mod tests {
         let bytes = serialize_engine_data(&engine, false);
         let b64 = base64_encode(&bytes);
 
-        let mut info = LayerAdditionalInfo::default();
-        info.engine_data = Some(b64.clone());
+        let info = LayerAdditionalInfo {
+            engine_data: Some(b64.clone()),
+            ..Default::default()
+        };
 
         let out = roundtrip(info);
         assert_eq!(out.engine_data, Some(b64));
@@ -883,5 +893,29 @@ mod tests {
             let dec = base64_decode(&enc).expect("decode");
             assert_eq!(dec, input);
         }
+    }
+
+    #[test]
+    fn every_enum_codec_default_is_a_map_key() {
+        // The default must be a map KEY: `encode(None)` resolves through `map[def]`.
+        for codec in [
+            text_gridding_codec(),
+            ornt_codec(),
+            annt_codec(),
+            warp_style_codec(),
+        ] {
+            assert!(codec.default_is_valid());
+        }
+    }
+
+    #[test]
+    fn annt_decodes_photoshop_2026_long_form() {
+        // Photoshop 2026 writes the map key ('sharp') or its camelCase id instead of
+        // the historical code ('antiAliasSharp'); both must resolve.
+        let codec = annt_codec();
+        assert_eq!(codec.decode("Annt.antiAliasSharp").unwrap(), "sharp");
+        assert_eq!(codec.decode("Annt.sharp").unwrap(), "sharp");
+        assert_eq!(codec.decode("Annt.platformLCD").unwrap(), "platformLCD");
+        assert!(codec.decode("Annt.nonsense").is_err());
     }
 }

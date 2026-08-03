@@ -43,7 +43,7 @@ use crate::psd::{
 // EngineValue access helpers (mirror loose JS property access)
 // ===========================================================================
 
-fn dict<'a>(v: &'a EngineValue) -> Option<&'a [(String, EngineValue)]> {
+fn dict(v: &EngineValue) -> Option<&[(String, EngineValue)]> {
     match v {
         EngineValue::Dict(m) => Some(m),
         _ => None,
@@ -1037,8 +1037,8 @@ pub fn encode_engine_data(data: &LayerTextData) -> EngineValue {
         }
     } else {
         let mut last = 0usize;
-        for i in 0..text_units.len() {
-            if text_units[i] == 13 {
+        for (i, unit) in text_units.iter().enumerate() {
+            if *unit == 13 {
                 // \r
                 paragraph_run_length_array.push((i - last + 1) as f64);
                 let merged = merge_paragraph(&default_para, &data_paragraph_style);

@@ -69,7 +69,9 @@ fn read_blend_mode(reader: &mut PsdReader) -> ReadResult<crate::psd::BlendMode> 
 fn write_blend_mode(writer: &mut PsdWriter, mode: Option<crate::psd::BlendMode>) {
     write_signature(writer, "8BIM");
     match mode {
-        Some(m) => write_signature(writer, from_blend_mode(m)),
+        // Mirror `fromBlendMode[mode!] || 'norm'`: a descriptor-only mode has no
+        // legacy signature, so it degrades to 'norm' here.
+        Some(m) => write_signature(writer, from_blend_mode(m).unwrap_or("norm")),
         None => write_signature(writer, "norm"),
     }
 }

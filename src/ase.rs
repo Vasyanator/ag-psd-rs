@@ -361,6 +361,30 @@ mod tests {
         assert_eq!(ase, decoded);
     }
 
+    /// A colour-type index outside `global`/`spot`/`normal` must be rejected
+    /// rather than silently producing an entry without a type.
+    #[test]
+    fn ase_rejects_invalid_color_type() {
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(b"ASEF");
+        bytes.extend_from_slice(&1u16.to_be_bytes()); // version major
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // version minor
+        bytes.extend_from_slice(&1u32.to_be_bytes()); // one block
+
+        let mut block: Vec<u8> = Vec::new();
+        block.extend_from_slice(&1u16.to_be_bytes()); // name length: just the terminator
+        block.extend_from_slice(&0u16.to_be_bytes()); // trailing null
+        block.extend_from_slice(b"Gray");
+        block.extend_from_slice(&0.5f32.to_be_bytes());
+        block.extend_from_slice(&3u16.to_be_bytes()); // colour type index out of range
+
+        bytes.extend_from_slice(&0x0001u16.to_be_bytes()); // colour block
+        bytes.extend_from_slice(&(block.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&block);
+
+        assert!(read_ase(&bytes).is_err());
+    }
+
     #[test]
     fn ase_rejects_bad_signature() {
         let bytes = b"XXXX\x00\x01\x00\x00\x00\x00\x00\x00";
@@ -394,8 +418,9 @@ mod tests {
                 match &c.color {
                     AseColorValue::Rgb { r, g, b, type_ } => {
                         assert_eq!(*r, 1.0);
-                        assert!((*g - 0.79998779).abs() < 1e-4);
-                        assert!((*b - 0.79998779).abs() < 1e-4);
+                        // 0xCC/0xFF stored as f32 == 0.7999878 (13107/16384).
+                        assert!((*g - 0.7999878).abs() < 1e-4);
+                        assert!((*b - 0.7999878).abs() < 1e-4);
                         assert_eq!(*type_, AseColorType::Global);
                     }
                     other => panic!("expected rgb, got {:?}", other),

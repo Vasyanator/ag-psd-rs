@@ -20,6 +20,9 @@ Source compatibility:
 - camelCase -> snake_case. Для 4-char PSD-ключей и неочевидных имён в
   doc-комментарии указано оригинальное TS-имя.
 - структуры derive `Debug, Clone` (+ `Default`, где есть осмысленный default).
+  Exception: `ReadOptions` implements `Default` by hand, because its default is
+  not all-`None` — it carries the 2 GiB `total_memory_limit` budget that upstream
+  `readPsd` installs when the option is absent.
 - массивы -> `Vec<T>`; `Option<Box<T>>` только для разрыва рекурсии.
 
 Маппинг canvas / imageData:
@@ -37,7 +40,8 @@ Source compatibility:
   тоже определены здесь. Никакие ещё-stub-модули не трогаются.
 */
 
-// PORT STATUS: types ported; read/write orchestration pending
+// PORT STATUS: ported. This file holds the document model only; the read/write
+// orchestration that upstream keeps in `psd.ts` lives in `reader.rs`/`writer.rs`.
 
 // ===========================================================================
 // Canvas / pixel data mapping
@@ -117,6 +121,13 @@ pub enum BlendMode {
     Color,
     /// "luminosity"
     Luminosity,
+    /// "linear height" — descriptor-only (`BlnM.linearHeight`), used in ABR brushes.
+    /// The legacy layer-record signature table has no code for it.
+    LinearHeight,
+    /// "height" — descriptor-only (`BlnM.Hght`), used in ABR brushes.
+    Height,
+    /// "subtraction" — descriptor-only (`BlnM.Sbtr`), a second encoding of subtract.
+    Subtraction,
 }
 
 // ===========================================================================
@@ -659,7 +670,12 @@ pub enum StrokeFillType {
     Pattern,
 }
 
-/// TS `EffectNoiseGradient.colorModel` and similar `'rgb' | 'hsb' | 'lab'`.
+/// TS `EffectNoiseGradient.colorModel` and similar `'rgb' | 'hsb' | 'lab' | 'hsl'`.
+///
+/// `Hsl` exists only in the descriptor enum `ClrS` (upstream v31). The `grdm`
+/// adjustment reuses this type but its binary color-model table has no slot for
+/// `hsl`; writing it there falls back to the rgb slot, mirroring upstream's
+/// `indexOf(...) === -1 -> 3`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GradientColorModel {
     /// "rgb"
@@ -668,6 +684,8 @@ pub enum GradientColorModel {
     Hsb,
     /// "lab"
     Lab,
+    /// "hsl"
+    Hsl,
 }
 
 /// TS `BezierPath.fillRule = 'even-odd' | 'non-zero'`.
@@ -2558,6 +2576,12 @@ pub struct AnimationFrame {
 }
 
 /// TS `TimelineKey` payload (the `type`-tagged second half of the union).
+// `Style` embeds a whole `LayerEffectsInfo` (~1 KiB), so the enum is much larger
+// than its other variants. Boxing that field is deliberately NOT done: this enum is
+// part of the crate's published API, and `Box<Option<LayerEffectsInfo>>` would change
+// the shape every downstream construction/match site sees. Timeline keys are held one
+// per keyframe (never in bulk buffers), so the padding is not a measurable cost.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum TimelineKeyData {
     /// "opacity"
@@ -3265,6 +3289,90 @@ pub struct ImageResources {
     pub url: Option<String>,
 }
 
+impl ImageResources {
+    /// True when no image resource has been decoded into this struct.
+    ///
+    /// Mirrors upstream's `Object.keys(rest).length` guard, where `rest` is the
+    /// image-resource bag minus `layersGroup`/`layerGroupsEnabledId` — exactly the
+    /// fields modelled here. The reader uses it to leave `Psd::image_resources` at
+    /// `None` for a document that carries no resources at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        // Destructured exhaustively on purpose: adding a field to `ImageResources`
+        // must force this emptiness check to be reconsidered rather than silently
+        // ignoring the new field.
+        let ImageResources {
+            layer_state,
+            layer_selection_ids,
+            version_info,
+            alpha_identifiers,
+            alpha_channel_names,
+            global_angle,
+            global_altitude,
+            pixel_aspect_ratio,
+            urls_list,
+            grid_and_guides_information,
+            resolution_info,
+            thumbnail,
+            thumbnail_raw,
+            caption_digest,
+            xmp_metadata,
+            print_scale,
+            print_information,
+            background_color,
+            ids_seed_number,
+            print_flags,
+            icc_untagged_profile,
+            path_selection_state,
+            image_ready_variables,
+            image_ready_data_sets,
+            animations,
+            onion_skins,
+            timeline_information,
+            sheet_disclosure,
+            count_information,
+            slices,
+            layer_comps,
+            copyrighted,
+            url,
+        } = self;
+
+        layer_state.is_none()
+            && layer_selection_ids.is_none()
+            && version_info.is_none()
+            && alpha_identifiers.is_none()
+            && alpha_channel_names.is_none()
+            && global_angle.is_none()
+            && global_altitude.is_none()
+            && pixel_aspect_ratio.is_none()
+            && urls_list.is_none()
+            && grid_and_guides_information.is_none()
+            && resolution_info.is_none()
+            && thumbnail.is_none()
+            && thumbnail_raw.is_none()
+            && caption_digest.is_none()
+            && xmp_metadata.is_none()
+            && print_scale.is_none()
+            && print_information.is_none()
+            && background_color.is_none()
+            && ids_seed_number.is_none()
+            && print_flags.is_none()
+            && icc_untagged_profile.is_none()
+            && path_selection_state.is_none()
+            && image_ready_variables.is_none()
+            && image_ready_data_sets.is_none()
+            && animations.is_none()
+            && onion_skins.is_none()
+            && timeline_information.is_none()
+            && sheet_disclosure.is_none()
+            && count_information.is_none()
+            && slices.is_none()
+            && layer_comps.is_none()
+            && copyrighted.is_none()
+            && url.is_none()
+    }
+}
+
 // ===========================================================================
 // Global mask info / annotations
 // ===========================================================================
@@ -3406,6 +3514,13 @@ pub struct Psd {
     pub artboards: Option<PsdArtboards>,
     pub global_layer_mask_info: Option<GlobalLayerMaskInfo>,
     pub annotations: Option<Vec<Annotation>>,
+    /// TS `rawCompositeData?: Uint8Array` — undecoded composite image section.
+    ///
+    /// Filled instead of `canvas`/`image_data` when [`ReadOptions::use_raw_data`]
+    /// is set: it holds the raw bytes of the composite image data section (from
+    /// its first byte to the end of the file), so decoding can be deferred to
+    /// `reader::get_composite_image_data`.
+    pub raw_composite_data: Option<Vec<u8>>,
 }
 
 // ===========================================================================
@@ -3416,7 +3531,11 @@ pub struct Psd {
 ///
 /// The development-only `log?: (...args) => void` callback is not modeled here
 /// (it is behaviour, not data); other dev flags are kept.
-#[derive(Debug, Clone, Default)]
+///
+/// Note that [`ReadOptions::default()`] is **not** an all-`None` value: it
+/// carries the upstream default memory limit (see
+/// [`ReadOptions::total_memory_limit`]).
+#[derive(Debug, Clone)]
 pub struct ReadOptions {
     /// Does not load layer image data.
     pub skip_layer_image_data: Option<bool>,
@@ -3426,12 +3545,26 @@ pub struct ReadOptions {
     pub skip_thumbnail: Option<bool>,
     /// Does not load linked files (used in smart-objects).
     pub skip_linked_files_data: Option<bool>,
+    /// Total memory budget, in bytes, for bitmaps decoded while reading a file.
+    ///
+    /// `None` means unlimited; [`ReadOptions::default()`] carries
+    /// `Some(2 GiB)`. Exceeding the budget aborts the read with
+    /// `reader::ReadError::ExceededMemoryLimit`.
+    ///
+    /// Difference from JS: upstream distinguishes an *absent* `totalMemoryLimit`
+    /// property (which is replaced by the 2 GiB default) from an explicitly
+    /// `undefined` one (which disables the limit). Rust has no such distinction,
+    /// so the 2 GiB default lives in `Default` and `None` is the explicit
+    /// "unlimited" request.
+    pub total_memory_limit: Option<usize>,
     /// Throws exception if features are missing.
     pub throw_for_missing_features: Option<bool>,
     /// Logs if features are missing.
     pub log_missing_features: Option<bool>,
     /// Keep image data as byte array instead of canvas.
     pub use_image_data: Option<bool>,
+    /// Skips decoding layer and composite bitmaps; they can be decoded later
+    /// with the `reader::get_*_image_data` helpers.
     pub use_raw_data: Option<bool>,
     /// Loads thumbnail raw data instead of decoding into canvas.
     pub use_raw_thumbnail: Option<bool>,
@@ -3443,6 +3576,34 @@ pub struct ReadOptions {
     pub debug: Option<bool>,
     // TS `log?: (...args: any[]) => void;` — поведение, не данные; не портируем.
 }
+
+/// Upstream default: every flag off, but the bitmap memory budget set to 2 GiB
+/// (`readPsd` installs that value when `totalMemoryLimit` is not present in the
+/// options object). Written by hand because `#[derive(Default)]` cannot express
+/// a non-`None` default for a single field.
+impl Default for ReadOptions {
+    fn default() -> Self {
+        ReadOptions {
+            skip_layer_image_data: None,
+            skip_composite_image_data: None,
+            skip_thumbnail: None,
+            skip_linked_files_data: None,
+            total_memory_limit: Some(DEFAULT_TOTAL_MEMORY_LIMIT),
+            throw_for_missing_features: None,
+            log_missing_features: None,
+            use_image_data: None,
+            use_raw_data: None,
+            use_raw_thumbnail: None,
+            log_dev_features: None,
+            strict: None,
+            debug: None,
+        }
+    }
+}
+
+/// Default bitmap memory budget used by [`ReadOptions::default()`]: 2 GiB,
+/// mirroring upstream `readPsd`.
+pub const DEFAULT_TOTAL_MEMORY_LIMIT: usize = 2 * 1024 * 1024 * 1024;
 
 /// TS `WriteOptions`.
 #[derive(Debug, Clone, Default)]

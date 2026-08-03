@@ -26,11 +26,13 @@ GROUP-MODULE CONTRACT (см. mod.rs):
 ==========================================================================
 CONSOLIDATION / FRAMEWORK GAPS (см. также отчёт воркера):
 
-1. read_pattern: примитив `readPattern` ещё НЕ портирован в reader.rs (он в
-   deferred-списке; в abr.rs есть локальная копия). Здесь — третья локальная
-   копия (`read_pattern` + `read_data_rle` + RGBA-копировальщики), повторяющая
-   abr.rs/psdReader.ts. КОНСОЛИДАЦИОННЫЙ ДОЛГ: вынести в reader.rs и переиспользовать
-   из abr.rs и отсюда. Для ЗАПИСИ паттернов используется `crate::writer::write_pattern`.
+1. read_pattern: CONSOLIDATED. `crate::reader::read_pattern` is the crate's only
+   implementation of the primitive; `read_patt` here and the ABR `patt` section both
+   call it, so both inherit its rectangle validation and its memory-budget accounting
+   (`ReadOptions::total_memory_limit`). A reader created by `PsdReader::new` carries no
+   budget (mirror of upstream `createReader`), so the ABR path stays unlimited exactly
+   as upstream; the document reader used for `Patt`/`Pat2`/`Pat3` carries the budget.
+   Pattern WRITING goes through `crate::writer::write_pattern`.
 
 2. linkedFiles / Psd-контекст: ReadCtx/WriteCtx НЕ несут ни `Psd`, ни список
    linkedFiles. Upstream `createLnkHandler` хранит связанные файлы в `psd.linkedFiles`
@@ -61,15 +63,13 @@ use crate::descriptor::{
 };
 use crate::helpers::{Dict, EnumCodec};
 use crate::psd::{
-    ColorMode, CustomEnvelopeWarp, LayerAdditionalInfo, NumDenom, Orientation, PatternBounds,
-    PatternInfo, PixelSource, PixelSourceFrameReader, PixelSourceFrameReaderLink,
-    PixelSourceInterpretation, PlacedLayer, PlacedLayerType, PointF, Units, UnitsBounds, UnitsValue,
-    Warp, WarpStyle,
+    CustomEnvelopeWarp, LayerAdditionalInfo, NumDenom, Orientation, PixelSource,
+    PixelSourceFrameReader, PixelSourceFrameReaderLink, PixelSourceInterpretation, PlacedLayer,
+    PlacedLayerType, PointF, Units, UnitsBounds, UnitsValue, Warp, WarpStyle,
 };
 use crate::reader::{
-    read_bytes, read_float64, read_int16, read_int32, read_pascal_string, read_signature,
-    read_uint16, read_uint32, read_uint8, read_unicode_string, skip_bytes, PsdReader, ReadError,
-    ReadResult,
+    read_float64, read_int32, read_pascal_string, read_pattern, read_signature, read_uint32,
+    skip_bytes, PsdReader, ReadError, ReadResult,
 };
 use crate::writer::{
     write_bytes, write_float64, write_int32, write_pattern, write_signature, write_uint32,
@@ -467,9 +467,11 @@ fn parse_warp(warp: &Descriptor) -> ReadResult<Warp> {
             }
             _ => (Vec::new(), Vec::new()),
         };
-        for i in 0..xs.len() {
+        // Upstream pairs the Hrzn/Vrtc value lists positionally; a missing Vrtc
+        // entry falls back to 0.0, so the loop is driven by the Hrzn list alone.
+        for (i, &x) in xs.iter().enumerate() {
             cew.mesh_points.push(PointF {
-                x: xs[i],
+                x,
                 y: *ys.get(i).unwrap_or(&0.0),
             });
         }
@@ -845,6 +847,17 @@ fn read_plld(
     Ok(())
 }
 
+/// Mirrors upstream `placed.pageNumber || 1` / `placed.totalPages || 1`.
+///
+/// A missing value and an explicit `0` both fall back to `1`: page indices are
+/// 1-based, and JS treats `0` as falsy at these write sites.
+fn page_value(value: Option<f64>) -> i32 {
+    match value {
+        Some(v) if v != 0.0 => v as i32,
+        _ => 1,
+    }
+}
+
 fn write_plld(writer: &mut PsdWriter, info: &LayerAdditionalInfo) -> ReadResult<()> {
     let placed = info
         .placed_layer
@@ -856,8 +869,8 @@ fn write_plld(writer: &mut PsdWriter, info: &LayerAdditionalInfo) -> ReadResult<
 
     check_guid(&placed.id)?;
     crate::writer::write_pascal_string(writer, &placed.id, 1);
-    write_int32(writer, 1); // pageNumber
-    write_int32(writer, 1); // totalPages
+    write_int32(writer, page_value(placed.page_number)); // pageNumber
+    write_int32(writer, page_value(placed.total_pages)); // totalPages
     write_int32(writer, 16); // antiAliasPolicy
     let t = placed
         .layer_type
@@ -967,10 +980,10 @@ fn write_sold(writer: &mut PsdWriter, info: &LayerAdditionalInfo) -> ReadResult<
         "placed",
         DescriptorValue::Text(placed.placed.clone().unwrap_or_else(|| placed.id.clone())),
     );
-    desc.set("PgNm", DescriptorValue::Integer(placed.page_number.unwrap_or(1.0) as i32));
+    desc.set("PgNm", DescriptorValue::Integer(page_value(placed.page_number)));
     desc.set(
         "totalPages",
-        DescriptorValue::Integer(placed.total_pages.unwrap_or(1.0) as i32),
+        DescriptorValue::Integer(page_value(placed.total_pages)),
     );
     if let Some(crop) = placed.crop {
         desc.set("Crop", DescriptorValue::Integer(crop as i32));
@@ -1199,285 +1212,16 @@ fn pad_sig(value: Option<&str>, empty: &str) -> String {
     }
 }
 
-// ===========================================================================
-// read_pattern (LOCAL PORT — see CONSOLIDATION GAP 1)
-// Зеркало psdReader.ts readPattern (RGB / Grayscale; Indexed читает палитру).
-// ===========================================================================
-
-struct ChannelData<'a> {
-    data: &'a mut [u8],
-    width: usize,
-    height: usize,
-}
-
-fn read_pattern(reader: &mut PsdReader) -> ReadResult<PatternInfo> {
-    let mut length = read_uint32(reader)? as usize;
-    while length % 4 != 0 {
-        length += 1;
-    }
-    let end = reader.offset + length;
-    let version = read_uint32(reader)?;
-    if version != 1 {
-        return Err(ReadError::StrictViolation(format!(
-            "Invalid pattern version: {version}"
-        )));
-    }
-
-    let color_mode = read_uint32(reader)? as i32;
-    let x = read_int16(reader)?;
-    let y = read_int16(reader)?;
-
-    let rgb = ColorMode::Rgb as i32;
-    let grayscale = ColorMode::Grayscale as i32;
-    let indexed = ColorMode::Indexed as i32;
-    if color_mode != rgb && color_mode != grayscale && color_mode != indexed {
-        return Err(ReadError::StrictViolation(format!(
-            "Unsupported pattern color mode: {color_mode}"
-        )));
-    }
-
-    let name = read_unicode_string(reader)?;
-    let id = read_pascal_string(reader, 1)?;
-
-    if color_mode == indexed {
-        for _ in 0..256 {
-            read_uint8(reader)?;
-            read_uint8(reader)?;
-            read_uint8(reader)?;
-        }
-        skip_bytes(reader, 4);
-    }
-
-    let version2 = read_uint32(reader)?;
-    if version2 != 3 {
-        return Err(ReadError::StrictViolation(format!(
-            "Invalid pattern VMAL version: {version2}"
-        )));
-    }
-
-    read_uint32(reader)?; // length
-    let top = read_uint32(reader)?;
-    let left = read_uint32(reader)?;
-    let bottom = read_uint32(reader)?;
-    let right = read_uint32(reader)?;
-    let channels_count = read_uint32(reader)?;
-    let width = (right - left) as usize;
-    let height = (bottom - top) as usize;
-    let mut data = vec![0u8; width * height * 4];
-    let mut i = 3;
-    while i < data.len() {
-        data[i] = 255;
-        i += 4;
-    }
-
-    let mut ch = 0usize;
-    for _ in 0..(channels_count + 2) {
-        let has = read_uint32(reader)?;
-        if has == 0 {
-            continue;
-        }
-        let clen = read_uint32(reader)? as usize;
-        let pixel_depth = read_uint32(reader)?;
-        let ctop = read_uint32(reader)?;
-        let cleft = read_uint32(reader)?;
-        let cbottom = read_uint32(reader)?;
-        let cright = read_uint32(reader)?;
-        let pixel_depth2 = read_uint16(reader)?;
-        let compression_mode = read_uint8(reader)?;
-        let data_length = clen - (4 + 16 + 2 + 1);
-        let cdata = read_bytes(reader, data_length)?;
-
-        if pixel_depth != 8 || pixel_depth2 != 8 {
-            return Err(ReadError::StrictViolation(
-                "16bit pixel depth not supported for patterns".to_string(),
-            ));
-        }
-
-        let w = (cright - cleft) as usize;
-        let h = (cbottom - ctop) as usize;
-        let ox = (cleft - left) as usize;
-        let oy = (ctop - top) as usize;
-
-        if compression_mode == 0 {
-            if color_mode == rgb && ch < 3 {
-                for yy in 0..h {
-                    for xx in 0..w {
-                        let src = xx + yy * w;
-                        let dst = (ox + xx + (yy + oy) * width) * 4;
-                        data[dst + ch] = cdata[src];
-                    }
-                }
-            }
-            if color_mode == grayscale && ch < 1 {
-                for yy in 0..h {
-                    for xx in 0..w {
-                        let src = xx + yy * w;
-                        let dst = (ox + xx + (yy + oy) * width) * 4;
-                        let value = cdata[src];
-                        data[dst] = value;
-                        data[dst + 1] = value;
-                        data[dst + 2] = value;
-                    }
-                }
-            }
-            if color_mode == indexed {
-                return Err(ReadError::StrictViolation(
-                    "Indexed pattern color mode not implemented".to_string(),
-                ));
-            }
-        } else if compression_mode == 1 {
-            let mut temp = vec![0u8; w * h];
-            let mut cdata_reader = PsdReader::new(&cdata, None, None);
-
-            if color_mode == rgb && ch < 3 {
-                {
-                    let mut pd = ChannelData { data: &mut temp, width: w, height: h };
-                    read_data_rle(&mut cdata_reader, Some(&mut pd), w, h, &[0])?;
-                }
-                copy_channel_to_rgba(&temp, w, h, &mut data, width, ox, oy, ch);
-            }
-            if color_mode == grayscale && ch < 1 {
-                {
-                    let mut pd = ChannelData { data: &mut temp, width: w, height: h };
-                    read_data_rle(&mut cdata_reader, Some(&mut pd), w, h, &[0])?;
-                }
-                copy_channel_to_rgba(&temp, w, h, &mut data, width, ox, oy, 0);
-                setup_grayscale(&mut data, width, height);
-            }
-            if color_mode == indexed {
-                return Err(ReadError::StrictViolation(
-                    "Indexed pattern color mode not implemented".to_string(),
-                ));
-            }
-        } else {
-            return Err(ReadError::StrictViolation(
-                "Invalid pattern compression mode".to_string(),
-            ));
-        }
-
-        ch += 1;
-    }
-
-    reader.offset = end;
-
-    Ok(PatternInfo {
-        id,
-        name,
-        x: x as f64,
-        y: y as f64,
-        bounds: PatternBounds {
-            x: left as f64,
-            y: top as f64,
-            w: width as f64,
-            h: height as f64,
-        },
-        data,
-    })
-}
-
-fn read_data_rle(
-    reader: &mut PsdReader,
-    pixel_data: Option<&mut ChannelData>,
-    width: usize,
-    height: usize,
-    offsets: &[usize],
-) -> ReadResult<()> {
-    let step = 1usize;
-    let mut lengths: Vec<u16> = vec![0; offsets.len() * height];
-    let mut li = 0usize;
-    for _ in 0..offsets.len() {
-        for _ in 0..height {
-            lengths[li] = read_uint16(reader)?;
-            li += 1;
-        }
-    }
-
-    let extra_limit = step.wrapping_sub(1);
-    let has_data = pixel_data.is_some();
-    let mut data: Option<&mut [u8]> = pixel_data.map(|p| &mut *p.data);
-
-    li = 0;
-    for c in 0..offsets.len() {
-        let offset = offsets[c];
-        let extra = c > extra_limit || offset > extra_limit;
-
-        if !has_data || extra {
-            for _ in 0..height {
-                skip_bytes(reader, lengths[li] as usize);
-                li += 1;
-            }
-        } else {
-            let mut p = offset;
-            for _ in 0..height {
-                let length = lengths[li] as usize;
-                let buffer = read_bytes(reader, length)?;
-                li += 1;
-
-                let buf = data.as_deref_mut().unwrap();
-                let mut i = 0usize;
-                let mut x = 0usize;
-                while i < length {
-                    let mut header = buffer[i] as i32;
-                    if header > 128 {
-                        i += 1;
-                        let value = buffer[i];
-                        header = 256 - header;
-                        let mut j = 0;
-                        while j <= header && x < width {
-                            buf[p] = value;
-                            p += step;
-                            j += 1;
-                            x += 1;
-                        }
-                    } else if header < 128 {
-                        let mut j = 0;
-                        while j <= header && x < width {
-                            i += 1;
-                            buf[p] = buffer[i];
-                            p += step;
-                            j += 1;
-                            x += 1;
-                        }
-                    }
-                    i += 1;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn setup_grayscale(data: &mut [u8], width: usize, height: usize) {
-    let size = width * height * 4;
-    let mut i = 0;
-    while i < size {
-        let c = data[i];
-        data[i + 1] = c;
-        data[i + 2] = c;
-        i += 4;
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn copy_channel_to_rgba(
-    src: &[u8],
-    src_w: usize,
-    src_h: usize,
-    dst: &mut [u8],
-    dst_w: usize,
-    ox: usize,
-    oy: usize,
-    offset: usize,
-) {
-    for y in 0..src_h {
-        for x in 0..src_w {
-            let s = x + y * src_w;
-            let d = (ox + x + (y + oy) * dst_w) * 4;
-            dst[d + offset] = src[s];
-        }
-    }
-}
-
+/// Reads the `Patt`/`Pat2`/`Pat3` section: back-to-back pattern records until
+/// the section is exhausted.
+///
+/// Decoding is delegated to [`crate::reader::read_pattern`], the crate's single
+/// implementation of the primitive, so this path is covered by its rectangle
+/// validation and by the `ReadOptions::total_memory_limit` budget carried by the
+/// document reader.
+///
+/// # Errors
+/// Propagates every error of [`crate::reader::read_pattern`].
 fn read_patt(
     reader: &mut PsdReader,
     info: &mut LayerAdditionalInfo,
@@ -1497,6 +1241,7 @@ fn read_patt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::psd::{ColorMode, PatternBounds, PatternInfo};
     use crate::reader::PsdReader;
     use crate::writer::{create_writer_default, get_writer_buffer};
 
@@ -1525,8 +1270,10 @@ mod tests {
 
     #[test]
     fn sold_round_trip() {
-        let mut info = LayerAdditionalInfo::default();
-        info.placed_layer = Some(sample_placed());
+        let info = LayerAdditionalInfo {
+            placed_layer: Some(sample_placed()),
+            ..LayerAdditionalInfo::default()
+        };
 
         // write inside an open section (here we just write the body directly).
         let mut writer = create_writer_default();
@@ -1587,6 +1334,192 @@ mod tests {
         }
     }
 
+    /// Builds a pattern record whose channels are stored uncompressed
+    /// (`compressionMode == 0`).
+    ///
+    /// `channels` supplies one `w * h` sample plane per present channel, in
+    /// channel order; two absent slots are appended because the reader always
+    /// walks `channelsCount + 2` entries. `palette` must be `Some` exactly for
+    /// `ColorMode::Indexed`.
+    ///
+    /// Feeds the shared `crate::reader::read_pattern`; `abr.rs` keeps a similar
+    /// builder for the ABR-side test of the same function.
+    fn raw_pattern_bytes(
+        color_mode: ColorMode,
+        palette: Option<&[[u8; 3]; 256]>,
+        channels: &[&[u8]],
+        w: u32,
+        h: u32,
+    ) -> Vec<u8> {
+        use crate::writer::{
+            write_int16, write_pascal_string, write_uint16, write_uint8, write_unicode_string,
+        };
+
+        let mut body = create_writer_default();
+        write_uint32(&mut body, 1); // version
+        write_uint32(&mut body, color_mode as u32);
+        write_int16(&mut body, 0); // x
+        write_int16(&mut body, 0); // y
+        write_unicode_string(&mut body, "pat\0");
+        write_pascal_string(&mut body, "deadbeef-0000-0000-0000-000000000000", 1);
+
+        if let Some(palette) = palette {
+            for entry in palette.iter() {
+                write_uint8(&mut body, entry[0]);
+                write_uint8(&mut body, entry[1]);
+                write_uint8(&mut body, entry[2]);
+            }
+            write_uint32(&mut body, 0); // 4 bytes the reader skips
+        }
+
+        write_uint32(&mut body, 3); // virtual memory array list version
+        write_uint32(&mut body, 0); // list length, unused by the reader
+        write_uint32(&mut body, 0); // top
+        write_uint32(&mut body, 0); // left
+        write_uint32(&mut body, h); // bottom
+        write_uint32(&mut body, w); // right
+        write_uint32(&mut body, channels.len() as u32);
+
+        for channel in channels {
+            write_uint32(&mut body, 1); // has
+            write_uint32(&mut body, (channel.len() + 4 + 16 + 2 + 1) as u32);
+            write_uint32(&mut body, 8); // pixelDepth
+            write_uint32(&mut body, 0); // ctop
+            write_uint32(&mut body, 0); // cleft
+            write_uint32(&mut body, h); // cbottom
+            write_uint32(&mut body, w); // cright
+            write_uint16(&mut body, 8); // pixelDepth2
+            write_uint8(&mut body, 0); // compressionMode: raw
+            write_bytes(&mut body, Some(channel));
+        }
+        write_uint32(&mut body, 0); // absent slot
+        write_uint32(&mut body, 0); // absent slot
+
+        let mut payload = get_writer_buffer(&body);
+        // The reader rounds the record length up to a multiple of 4 before
+        // computing the record end, so keep the payload aligned.
+        while payload.len() % 4 != 0 {
+            payload.push(0);
+        }
+
+        let mut out = create_writer_default();
+        write_uint32(&mut out, payload.len() as u32);
+        write_bytes(&mut out, Some(&payload));
+        get_writer_buffer(&out)
+    }
+
+    #[test]
+    fn read_pattern_decodes_indexed_raw_data() {
+        let mut palette = [[0u8; 3]; 256];
+        palette[1] = [10, 20, 30];
+        palette[2] = [40, 50, 60];
+        palette[3] = [70, 80, 90];
+        palette[4] = [100, 110, 120];
+        let indices: [u8; 4] = [1, 2, 3, 4];
+        let bytes = raw_pattern_bytes(ColorMode::Indexed, Some(&palette), &[&indices], 2, 2);
+
+        let mut reader = PsdReader::new(&bytes, None, None);
+        let out = read_pattern(&mut reader).expect("indexed pattern must decode");
+
+        assert_eq!(out.bounds.w, 2.0);
+        assert_eq!(out.bounds.h, 2.0);
+        for (px, index) in indices.iter().enumerate() {
+            let color = palette[*index as usize];
+            assert_eq!(&out.data[px * 4..px * 4 + 3], &color[..], "pixel {px}");
+            assert_eq!(out.data[px * 4 + 3], 255, "pixel {px} alpha");
+        }
+    }
+
+    /// The live `Patt`/`Pat2`/`Pat3` path must reject a hostile pattern
+    /// rectangle with a typed error.
+    ///
+    /// Regression test for the guard being wired into the wrong copy of
+    /// `read_pattern`: this module used to decode patterns with its own,
+    /// unguarded copy, so `bottom`/`right` of `0xffffffff` reached
+    /// `vec![0u8; width * height * 4]` — a wrapping multiplication (release) or
+    /// an overflow panic (debug), and no memory-budget check at all.
+    #[test]
+    fn patt_rejects_a_hostile_pattern_rectangle() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&100u32.to_be_bytes()); // record length
+        bytes.extend_from_slice(&1u32.to_be_bytes()); // version
+        bytes.extend_from_slice(&(ColorMode::Rgb as u32).to_be_bytes());
+        bytes.extend_from_slice(&0i16.to_be_bytes()); // x
+        bytes.extend_from_slice(&0i16.to_be_bytes()); // y
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // unicode name length
+        bytes.push(0); // pascal string id length
+        bytes.extend_from_slice(&3u32.to_be_bytes()); // VMAL version
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // VMAL length (unused)
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // top
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // left
+        bytes.extend_from_slice(&0xffff_ffffu32.to_be_bytes()); // bottom
+        bytes.extend_from_slice(&0xffff_ffffu32.to_be_bytes()); // right
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // channels count
+
+        let mut reader = PsdReader::new(&bytes, None, None);
+        // Same budget `read_psd` installs by default.
+        reader.total_memory_limit = Some(crate::psd::DEFAULT_TOTAL_MEMORY_LIMIT);
+        let total = bytes.len();
+        let left = move |r: &PsdReader| total.saturating_sub(r.offset);
+
+        let mut info = LayerAdditionalInfo::default();
+        let err = read_patt(&mut reader, &mut info, &left).unwrap_err();
+        assert_eq!(
+            err,
+            ReadError::InvalidBoxSize {
+                kind: "pattern",
+                width: 0xffff_ffff,
+                height: 0xffff_ffff
+            }
+        );
+        assert!(info.patterns.is_none(), "nothing must be stored on failure");
+    }
+
+    /// A raw channel that does not belong to the pattern's colour mode (here the
+    /// alpha channel of a grayscale pattern) is ignored by default and only
+    /// reported when `throw_for_missing_features` is set.
+    #[test]
+    fn read_pattern_reports_unhandled_raw_channel_only_when_requested() {
+        let gray: [u8; 4] = [10, 20, 30, 40];
+        let alpha: [u8; 4] = [255, 255, 255, 255];
+        let bytes = raw_pattern_bytes(ColorMode::Grayscale, None, &[&gray, &alpha], 2, 2);
+
+        let mut reader = PsdReader::new(&bytes, None, None);
+        let out = read_pattern(&mut reader).expect("grayscale pattern must decode");
+        for (px, value) in gray.iter().enumerate() {
+            assert_eq!(&out.data[px * 4..px * 4 + 3], &[*value, *value, *value][..]);
+        }
+
+        let mut strict = PsdReader::new(&bytes, None, None);
+        strict.options.throw_for_missing_features = Some(true);
+        assert!(read_pattern(&mut strict).is_err());
+    }
+
+    #[test]
+    fn plld_writes_page_numbers_from_data() {
+        let mut placed = sample_placed();
+        placed.page_number = Some(3.0);
+        placed.total_pages = Some(7.0);
+        let info = LayerAdditionalInfo {
+            placed_layer: Some(placed),
+            ..LayerAdditionalInfo::default()
+        };
+
+        let mut writer = create_writer_default();
+        write_plld(&mut writer, &info).unwrap();
+        let buf = get_writer_buffer(&writer);
+
+        let mut reader = PsdReader::new(&buf, None, None);
+        let total = buf.len();
+        let left = move |r: &PsdReader| total - r.offset;
+        let mut out = LayerAdditionalInfo::default();
+        read_plld(&mut reader, &mut out, &left).unwrap();
+
+        let p = out.placed_layer.expect("placed layer parsed");
+        assert_eq!(p.page_number, Some(3.0));
+        assert_eq!(p.total_pages, Some(7.0));
+    }
+
     #[test]
     fn lnk_write_framing_size_is_multiple_of_4() {
         use crate::psd::LinkedFile;
@@ -1603,5 +1536,13 @@ mod tests {
         assert_eq!(buf.len() % 4, 0);
         // first 4 bytes are the high half of length64 == 0.
         assert_eq!(&buf[0..4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn every_enum_codec_default_is_a_map_key() {
+        // The default must be a map KEY: `encode(None)` resolves through `map[def]`.
+        for codec in [ornt_codec(), warp_style_codec()] {
+            assert!(codec.default_is_valid());
+        }
     }
 }

@@ -13,7 +13,11 @@ Main responsibilities:
 Source compatibility:
 - зеркало `test/ag-psd/src/index.ts`.
 
-PORT STATUS: stub — модули объявлены, логика ещё не портирована.
+PORT STATUS: ported — модули объявлены и наполнены; re-export'ы держат публичный
+API крейта (read_psd / write_psd + lazy-bitmap хелперы), зеркалируя `index.ts`.
+Помимо функций, корень крейта обязан называть все типы из сигнатур публичного
+API (`ReadError`, `ReadResult`, `PixelData`) и `DEFAULT_TOTAL_MEMORY_LIMIT`;
+это зафиксировано тестом `crate_root_names_the_whole_read_api`.
 */
 
 //! # ag-psd
@@ -84,4 +88,33 @@ pub use abr::{read_abr, Abr, Brush, BrushShape, ReadAbrOptions, SampleInfo};
 pub use ase::{read_ase, write_ase, Ase, AseColor, AseColorValue, AseEntry, AseGroup};
 pub use csh::{read_csh, write_csh, Csh, CshShape};
 pub use reader::read_psd;
+// The read entry point returns `Result<Psd, ReadError>` and the document model
+// hands out `PixelData`, so both must be nameable without a module path, as must
+// the budget constant a caller needs in order to tune `total_memory_limit`.
+pub use psd::{PixelData, DEFAULT_TOTAL_MEMORY_LIMIT};
+pub use reader::{ReadError, ReadResult};
+// Lazy-bitmap API (upstream `index.ts` exports these next to `readPsd`): with
+// `ReadOptions::use_raw_data` the reader keeps compressed channel bytes instead of
+// decoding them, and these free functions decode a single layer/mask/composite on
+// demand. The upstream canvas variants have no Rust equivalent.
+pub use reader::{
+    decode_layer_pixels, get_composite_image_data, get_layer_image_data,
+    get_layer_mask_image_data, get_layer_real_mask_image_data,
+};
 pub use writer::{write_psd, write_psd_to_writer};
+
+#[cfg(test)]
+mod tests {
+    /// Everything the signature of the public read API mentions must be
+    /// nameable from the crate root — this test does not compile otherwise.
+    #[test]
+    fn crate_root_names_the_whole_read_api() {
+        let read: fn(&[u8], &crate::psd::ReadOptions) -> crate::ReadResult<crate::psd::Psd> =
+            crate::read_psd;
+        let _ = read;
+        let _: crate::ReadError = crate::ReadError::UnexpectedEndOfBuffer;
+        let _: usize = crate::DEFAULT_TOTAL_MEMORY_LIMIT;
+        let _: crate::PixelData =
+            crate::PixelData { width: 0, height: 0, data: Vec::new() };
+    }
+}

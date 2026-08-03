@@ -2,14 +2,14 @@
 File: crates/ag-psd/src/utf8.rs
 
 Purpose:
-кодирование и декодирование UTF-8 строк.
+UTF-8 encoding and decoding for PSD string payloads.
 
 Source compatibility:
-- порт upstream-файла `test/ag-psd/src/utf8.ts` (разбиение 1:1).
+- port of the upstream file `test/ag-psd/src/utf8.ts` (1:1 module split).
 
 Main responsibilities:
-- зеркалировать соответствующий upstream-модуль при портировании;
-- держать публичный контракт этого участка в одном месте.
+- mirror the upstream module's public contract;
+- keep the encode/decode contract of this area in one place.
 
 Mapping TS -> Rust:
 - `charLengthInBytes(code)`        -> `char_length_in_bytes(code: u32) -> usize`
@@ -17,49 +17,30 @@ Mapping TS -> Rust:
 - `writeCharacter(buf, off, code)` -> `write_character(buffer: &mut [u8], offset: usize, code: u32) -> usize`
 - `encodeStringTo(buf, off, val)`  -> `encode_string_to(buffer: &mut [u8], offset: usize, value: &str) -> usize`
 - `encodeString(value)`            -> `encode_string(value: &str) -> Vec<u8>`
-- `decodeString(value)`            -> `decode_string(value: &[u8]) -> Result<String, Utf8DecodeError>`
+- `decodeString(value)`            -> `decode_string(value: &[u8]) -> String`
+- `codePointAt(value, i)`          -> no equivalent, see below
 
 Notes on faithfulness:
-- Upstream работает на UTF-16 code units (`charCodeAt`) и вручную собирает суррогатные
-  пары перед кодированием в UTF-8. В Rust `&str` уже хранит валидный UTF-8, поэтому
-  ручная посимвольная сборка по `char`-ам (scalar values) даёт ровно те же байты, что и
-  ветвь `charLengthInBytes`/`writeCharacter` для любой валидной строки. Суррогаты в `&str`
-  невозможны, так что ветка склейки high/low surrogate автоматически выполняется самим Rust.
-- `decodeString` повторяет ручной UTF-8-декодер upstream'а, включая отклонение overlong-
-  последовательностей, одиночных суррогатов и кодов вне диапазона. Вместо `String::from_utf8`
-  оставлен ручной разбор, чтобы воспроизвести точную семантику ошибок upstream'а
-  (одиночные суррогаты, проверка границ continuation-байтов и т.п.).
+- Upstream iterates UTF-16 code units (`charCodeAt`) and assembles surrogate pairs by
+  hand before encoding to UTF-8. Its `codePointAt` helper exists to map an *unpaired*
+  surrogate to U+FFFD, because a JS string may contain one. Rust `&str` is guaranteed
+  well-formed UTF-8 and `chars()` yields Unicode scalar values only, so an unpaired
+  surrogate is unrepresentable and the helper has no meaning here: iterating `chars()`
+  already produces exactly the byte sequence upstream's fixed encoder produces.
+- `decode_string` follows the WHATWG Encoding Standard's non-fatal error mode (the
+  behaviour of `TextDecoder`), which is exactly what `String::from_utf8_lossy`
+  implements: every maximal malformed subsequence becomes a single U+FFFD instead of
+  raising an error. The hand-written decoder that used to live here rejected malformed
+  input; upstream deliberately stopped doing that, because a PSD produced by another
+  tool may carry slightly broken UTF-8 in a string resource and must still be readable.
+- Both upstream fast paths (`TextEncoder`/`TextDecoder` for inputs over 1000 units)
+  are irrelevant here: there is a single code path, so the length-dependent divergence
+  that upstream was fixing cannot occur.
 */
 
 // PORT STATUS: ported
 
-/// Ошибка ручного UTF-8-декодера (зеркало `throw Error(...)` из upstream).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Utf8DecodeError {
-    InvalidByteIndex,
-    InvalidContinuationByte,
-    LoneSurrogate(u32),
-    InvalidUtf8Detected,
-}
-
-impl std::fmt::Display for Utf8DecodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Utf8DecodeError::InvalidByteIndex => write!(f, "Invalid byte index"),
-            Utf8DecodeError::InvalidContinuationByte => write!(f, "Invalid continuation byte"),
-            Utf8DecodeError::LoneSurrogate(code) => write!(
-                f,
-                "Lone surrogate U+{} is not a scalar value",
-                format!("{:X}", code)
-            ),
-            Utf8DecodeError::InvalidUtf8Detected => write!(f, "Invalid UTF-8 detected"),
-        }
-    }
-}
-
-impl std::error::Error for Utf8DecodeError {}
-
-/// Длина в байтах для UTF-8-кодирования code point'а (зеркало `charLengthInBytes`).
+/// Byte length of the UTF-8 encoding of `code` (mirror of `charLengthInBytes`).
 fn char_length_in_bytes(code: u32) -> usize {
     if (code & 0xffff_ff80) == 0 {
         1
@@ -72,10 +53,12 @@ fn char_length_in_bytes(code: u32) -> usize {
     }
 }
 
-/// Сколько байт займёт строка в UTF-8 (зеркало `stringLengthInBytes`).
+/// Number of bytes `value` occupies when UTF-8 encoded (mirror of `stringLengthInBytes`).
 ///
-/// В TS итерация идёт по UTF-16 code unit'ам со сборкой суррогатов; в Rust `chars()`
-/// уже отдаёт scalar values, поэтому `char_length_in_bytes(c as u32)` эквивалентно.
+/// Guaranteed to equal `encode_string(value).len()`: `chars()` yields scalar values, so
+/// unlike the JS original this pre-pass cannot disagree with the encoder over an
+/// unpaired surrogate.
+#[must_use]
 pub fn string_length_in_bytes(value: &str) -> usize {
     let mut result = 0;
     for c in value.chars() {
@@ -84,8 +67,12 @@ pub fn string_length_in_bytes(value: &str) -> usize {
     result
 }
 
-/// Записать один code point в `buffer` начиная с `offset`, вернуть число записанных байт
-/// (зеркало `writeCharacter`).
+/// Write one code point into `buffer` starting at `offset`; returns the bytes written
+/// (mirror of `writeCharacter`).
+///
+/// # Panics
+/// Panics if `buffer` has fewer than `char_length_in_bytes(code)` bytes left after
+/// `offset`. Callers size the buffer with `string_length_in_bytes` first.
 fn write_character(buffer: &mut [u8], offset: usize, code: u32) -> usize {
     let length = char_length_in_bytes(code);
 
@@ -113,8 +100,12 @@ fn write_character(buffer: &mut [u8], offset: usize, code: u32) -> usize {
     length
 }
 
-/// Закодировать строку в `buffer` начиная с `offset`, вернуть новый offset
-/// (зеркало `encodeStringTo`).
+/// Encode `value` into `buffer` starting at `offset`; returns the offset past the last
+/// byte written (mirror of `encodeStringTo`).
+///
+/// # Panics
+/// Panics if `buffer` cannot hold `string_length_in_bytes(value)` bytes at `offset`.
+#[must_use]
 pub fn encode_string_to(buffer: &mut [u8], offset: usize, value: &str) -> usize {
     let mut offset = offset;
     for c in value.chars() {
@@ -123,109 +114,113 @@ pub fn encode_string_to(buffer: &mut [u8], offset: usize, value: &str) -> usize 
     offset
 }
 
-/// Закодировать строку в новый `Vec<u8>` (зеркало `encodeString`).
+/// Encode `value` into a freshly allocated `Vec<u8>` (mirror of `encodeString`).
 ///
-/// Upstream для длинных строк (>1000) делегирует в `TextEncoder` (стандартный UTF-8);
-/// ручная ветка для валидных строк даёт ровно те же байты, так что результат идентичен
-/// вне зависимости от длины.
+/// The result is always identical to `value.as_bytes()`; the explicit encoder is kept
+/// to mirror the upstream module structure and to keep `write_character` exercised.
+#[must_use]
 pub fn encode_string(value: &str) -> Vec<u8> {
     let mut buffer = vec![0u8; string_length_in_bytes(value)];
-    encode_string_to(&mut buffer, 0, value);
+    let end = encode_string_to(&mut buffer, 0, value);
+    // The invariant upstream's unpaired-surrogate bug used to break: the pre-pass that
+    // sizes the buffer and the encoder that fills it must agree on the byte count.
+    debug_assert_eq!(end, buffer.len());
     buffer
 }
 
-/// Прочитать continuation-байт по индексу `index` (зеркало `continuationByte`).
-fn continuation_byte(buffer: &[u8], index: usize) -> Result<u32, Utf8DecodeError> {
-    if index >= buffer.len() {
-        return Err(Utf8DecodeError::InvalidByteIndex);
-    }
-
-    let continuation_byte = buffer[index];
-
-    if (continuation_byte & 0xC0) == 0x80 {
-        Ok((continuation_byte & 0x3F) as u32)
-    } else {
-        Err(Utf8DecodeError::InvalidContinuationByte)
-    }
-}
-
-/// Декодировать UTF-8 байты в строку (зеркало `decodeString`).
+/// Decode UTF-8 bytes into a `String` (mirror of `decodeString`).
 ///
-/// Ручной разбор сохранён намеренно (вместо `String::from_utf8`), чтобы повторить точную
-/// семантику ошибок upstream'а.
-pub fn decode_string(value: &[u8]) -> Result<String, Utf8DecodeError> {
-    let mut result = String::new();
-    let mut i = 0usize;
-
-    while i < value.len() {
-        let byte1 = value[i] as u32;
-        i += 1;
-        let code: u32;
-
-        if (byte1 & 0x80) == 0 {
-            code = byte1;
-        } else if (byte1 & 0xe0) == 0xc0 {
-            let byte2 = continuation_byte(value, i)?;
-            i += 1;
-            code = ((byte1 & 0x1f) << 6) | byte2;
-
-            if code < 0x80 {
-                return Err(Utf8DecodeError::InvalidContinuationByte);
-            }
-        } else if (byte1 & 0xf0) == 0xe0 {
-            let byte2 = continuation_byte(value, i)?;
-            i += 1;
-            let byte3 = continuation_byte(value, i)?;
-            i += 1;
-            code = ((byte1 & 0x0f) << 12) | (byte2 << 6) | byte3;
-
-            if code < 0x0800 {
-                return Err(Utf8DecodeError::InvalidContinuationByte);
-            }
-
-            if (0xd800..=0xdfff).contains(&code) {
-                return Err(Utf8DecodeError::LoneSurrogate(code));
-            }
-        } else if (byte1 & 0xf8) == 0xf0 {
-            let byte2 = continuation_byte(value, i)?;
-            i += 1;
-            let byte3 = continuation_byte(value, i)?;
-            i += 1;
-            let byte4 = continuation_byte(value, i)?;
-            i += 1;
-            code = ((byte1 & 0x0f) << 0x12) | (byte2 << 0x0c) | (byte3 << 0x06) | byte4;
-
-            if code < 0x01_0000 || code > 0x10_ffff {
-                return Err(Utf8DecodeError::InvalidContinuationByte);
-            }
-        } else {
-            return Err(Utf8DecodeError::InvalidUtf8Detected);
-        }
-
-        // Upstream собирает UTF-16-строку (включая суррогатную пару для code > 0xFFFF).
-        // В Rust строка хранит scalar values, поэтому достаточно `char::from_u32`.
-        // Код к этому моменту уже провалидирован как валидный scalar value.
-        if let Some(ch) = char::from_u32(code) {
-            result.push(ch);
-        } else {
-            // Недостижимо для прошедших проверки кодов, но на всякий случай.
-            return Err(Utf8DecodeError::InvalidUtf8Detected);
-        }
-    }
-
-    Ok(result)
+/// Malformed input never fails: following the WHATWG Encoding Standard's non-fatal
+/// error mode, every maximal malformed subsequence — invalid lead byte, out-of-range
+/// continuation byte, overlong form, encoded surrogate, out-of-range scalar value, and
+/// a sequence truncated by the end of input — is replaced by U+FFFD. This matches
+/// `TextDecoder` and therefore upstream's decoder exactly.
+#[must_use]
+pub fn decode_string(value: &[u8]) -> String {
+    String::from_utf8_lossy(value).into_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // -- string_length_in_bytes (ported from upstream `utf8.spec.ts`) ----------------
+
+    #[test]
+    fn string_length_in_bytes_counts_ascii_as_one_byte() {
+        assert_eq!(string_length_in_bytes(""), 0);
+        assert_eq!(string_length_in_bytes("Hello"), 5);
+    }
+
+    #[test]
+    fn string_length_in_bytes_counts_polish_diacritics_as_two_bytes() {
+        assert_eq!(string_length_in_bytes("ą"), 2);
+        assert_eq!(string_length_in_bytes("ąćęłńóśźż"), 9 * 2);
+    }
+
+    #[test]
+    fn string_length_in_bytes_counts_cjk_as_three_bytes() {
+        assert_eq!(string_length_in_bytes("你好世界"), 4 * 3);
+        assert_eq!(string_length_in_bytes("こんにちは"), 5 * 3);
+        assert_eq!(string_length_in_bytes("カタカナ"), 4 * 3);
+        assert_eq!(string_length_in_bytes("漢字"), 2 * 3);
+    }
+
+    #[test]
+    fn string_length_in_bytes_counts_emoji_as_four_bytes() {
+        assert_eq!(string_length_in_bytes("😀"), 4);
+        assert_eq!(string_length_in_bytes("😀🎉👍"), 3 * 4);
+    }
+
+    #[test]
+    fn string_length_in_bytes_matches_encode_string() {
+        // Upstream's regression guard: the pre-pass that sizes the buffer must agree
+        // with the encoder that fills it, for every sample.
+        let samples = [
+            "Hello",
+            "Zażółć gęślą jaźń",
+            "你好，世界",
+            "こんにちは世界",
+            "😀🎉👨‍👩‍👧‍👦",
+        ];
+
+        for sample in samples {
+            assert_eq!(string_length_in_bytes(sample), encode_string(sample).len(), "{sample}");
+            assert_eq!(string_length_in_bytes(sample), sample.len(), "{sample}");
+        }
+    }
+
+    // -- encode/decode round trips ---------------------------------------------------
+
+    #[test]
+    fn round_trips_upstream_samples() {
+        let samples = [
+            ("empty string", ""),
+            ("ascii", "The quick brown fox jumps over the lazy dog."),
+            ("polish", "Zażółć gęślą jaźń"),
+            ("chinese", "你好，世界！这是一段中文文本。"),
+            ("japanese", "こんにちは世界、これは日本語のテキストです。"),
+            ("emoji", "😀🎉👍🍕🚀"),
+            ("emoji with skin tone modifier", "👍🏽"),
+            ("emoji with ZWJ sequence (family)", "👨‍👩‍👧‍👦"),
+            ("mixed scripts and emoji", "Hello Zażółć 你好 こんにちは 😀"),
+        ];
+
+        for (name, value) in samples {
+            let encoded = encode_string(value);
+            // The Rust encoder must agree with the standard UTF-8 representation, which
+            // is what upstream checks against `TextEncoder`.
+            assert_eq!(encoded, value.as_bytes(), "{name}");
+            assert_eq!(decode_string(&encoded), value, "{name}");
+        }
+    }
+
     #[test]
     fn ascii_round_trip() {
         let s = "Hello, World!";
         let bytes = encode_string(s);
         assert_eq!(bytes, s.as_bytes());
-        assert_eq!(decode_string(&bytes).unwrap(), s);
+        assert_eq!(decode_string(&bytes), s);
     }
 
     #[test]
@@ -234,7 +229,7 @@ mod tests {
         let bytes = encode_string(s);
         assert!(bytes.is_empty());
         assert_eq!(string_length_in_bytes(s), 0);
-        assert_eq!(decode_string(&bytes).unwrap(), s);
+        assert_eq!(decode_string(&bytes), s);
     }
 
     #[test]
@@ -247,7 +242,7 @@ mod tests {
         // "Пр" = D0 9F D1 80
         assert_eq!(&bytes[0..4], &[0xD0, 0x9F, 0xD1, 0x80]);
         assert_eq!(bytes, s.as_bytes());
-        assert_eq!(decode_string(&bytes).unwrap(), s);
+        assert_eq!(decode_string(&bytes), s);
     }
 
     #[test]
@@ -256,7 +251,7 @@ mod tests {
         let bytes = encode_string(s);
         assert_eq!(bytes, vec![0xE3, 0x81, 0x82]);
         assert_eq!(string_length_in_bytes(s), 3);
-        assert_eq!(decode_string(&bytes).unwrap(), s);
+        assert_eq!(decode_string(&bytes), s);
     }
 
     #[test]
@@ -265,7 +260,7 @@ mod tests {
         let bytes = encode_string(s);
         assert_eq!(bytes, vec![0xF0, 0x9F, 0x98, 0x80]);
         assert_eq!(string_length_in_bytes(s), 4);
-        assert_eq!(decode_string(&bytes).unwrap(), s);
+        assert_eq!(decode_string(&bytes), s);
     }
 
     #[test]
@@ -274,40 +269,89 @@ mod tests {
         let bytes = encode_string(s);
         assert_eq!(bytes, s.as_bytes());
         assert_eq!(string_length_in_bytes(s), s.len());
-        assert_eq!(decode_string(&bytes).unwrap(), s);
+        assert_eq!(decode_string(&bytes), s);
     }
 
     #[test]
-    fn decode_rejects_lone_surrogate() {
-        // ED A0 80 -> U+D800, a lone surrogate (upstream throws).
-        let err = decode_string(&[0xED, 0xA0, 0x80]).unwrap_err();
-        assert_eq!(err, Utf8DecodeError::LoneSurrogate(0xD800));
+    fn encode_string_to_writes_at_offset_and_returns_new_offset() {
+        let mut buffer = [0xffu8; 20];
+        let offset = encode_string_to(&mut buffer, 3, "ą😀");
+
+        // 'ą' -> 2 bytes, '😀' -> 4 bytes.
+        assert_eq!(offset, 3 + 2 + 4);
+        assert_eq!(&buffer[0..3], &[0xff, 0xff, 0xff]);
+        assert_eq!(&buffer[3..9], "ą😀".as_bytes());
+        assert_eq!(&buffer[9..], &[0xffu8; 11]);
+    }
+
+    // -- malformed input: WHATWG non-fatal error mode ---------------------------------
+    //
+    // Every expectation below was cross-checked against Node's `TextDecoder`, the same
+    // oracle upstream's spec uses. These replaced the previous tests, which asserted
+    // that the decoder rejects malformed input; upstream deliberately changed that
+    // contract, so the old expectations no longer describe correct behaviour.
+
+    #[test]
+    fn decode_replaces_invalid_lead_byte() {
+        assert_eq!(decode_string(&[0x61, 0xff, 0x62]), "a\u{FFFD}b");
     }
 
     #[test]
-    fn decode_rejects_overlong_two_byte() {
-        // C0 80 would decode to U+0000 (overlong) -> code < 0x80.
-        let err = decode_string(&[0xC0, 0x80]).unwrap_err();
-        assert_eq!(err, Utf8DecodeError::InvalidContinuationByte);
+    fn decode_replaces_lone_continuation_byte() {
+        assert_eq!(decode_string(&[0x80]), "\u{FFFD}");
     }
 
     #[test]
-    fn decode_rejects_bad_continuation() {
-        // C2 followed by a non-continuation byte.
-        let err = decode_string(&[0xC2, 0x20]).unwrap_err();
-        assert_eq!(err, Utf8DecodeError::InvalidContinuationByte);
+    fn decode_replaces_invalid_continuation_byte_and_resyncs() {
+        // The out-of-range byte is re-processed as a fresh sequence start, so '(' survives.
+        assert_eq!(decode_string(&[0x61, 0xe2, 0x28, 0xa1]), "a\u{FFFD}(\u{FFFD}");
+        assert_eq!(decode_string(&[0xc2, 0x20]), "\u{FFFD} ");
     }
 
     #[test]
-    fn decode_rejects_truncated() {
-        // E3 81 missing third byte -> index out of range.
-        let err = decode_string(&[0xE3, 0x81]).unwrap_err();
-        assert_eq!(err, Utf8DecodeError::InvalidByteIndex);
+    fn decode_replaces_truncated_sequence_at_end_of_input() {
+        assert_eq!(decode_string(&[0x61, 0xe2, 0x82]), "a\u{FFFD}");
+        assert_eq!(decode_string(&[0xE3, 0x81]), "\u{FFFD}");
     }
 
     #[test]
-    fn decode_rejects_invalid_lead() {
-        let err = decode_string(&[0xFF]).unwrap_err();
-        assert_eq!(err, Utf8DecodeError::InvalidUtf8Detected);
+    fn decode_replaces_overlong_two_byte_sequence() {
+        // C0 80 is the overlong encoding of NUL; C0 is not a valid lead byte at all.
+        assert_eq!(decode_string(&[0xc0, 0x80]), "\u{FFFD}\u{FFFD}");
+    }
+
+    #[test]
+    fn decode_replaces_overlong_four_byte_sequence() {
+        // F0 has lower boundary 0x90, so 80 is rejected and each byte becomes U+FFFD.
+        assert_eq!(decode_string(&[0xf0, 0x80, 0x80, 0x80]), "\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}");
+    }
+
+    #[test]
+    fn decode_replaces_encoded_surrogate() {
+        // ED A0 80 encodes U+D800, which is not a scalar value; ED caps at 0x9f.
+        assert_eq!(decode_string(&[0xED, 0xA0, 0x80]), "\u{FFFD}\u{FFFD}\u{FFFD}");
+    }
+
+    #[test]
+    fn decode_replaces_out_of_range_four_byte_sequence() {
+        // F4 90 80 80 encodes U+110000, past the last scalar value; F4 caps at 0x8f.
+        assert_eq!(
+            decode_string(&[0xf4, 0x90, 0x80, 0x80]),
+            "\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}"
+        );
+    }
+
+    #[test]
+    fn decode_long_malformed_buffer_matches_short_one() {
+        // Upstream had a >1000-byte `TextDecoder` fast path that disagreed with its
+        // hand-written decoder. This port has one code path; the test pins that down so
+        // no length-dependent shortcut can be reintroduced unnoticed.
+        let short = decode_string(&[0x61, 0xff, 0x62]);
+        let mut long_bytes = "x".repeat(2000).into_bytes();
+        long_bytes.extend_from_slice(&[0x61, 0xff, 0x62]);
+        let long = decode_string(&long_bytes);
+
+        assert_eq!(short, "a\u{FFFD}b");
+        assert_eq!(&long[2000..], "a\u{FFFD}b");
     }
 }

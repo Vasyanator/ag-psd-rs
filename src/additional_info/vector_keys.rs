@@ -612,22 +612,26 @@ mod tests {
 
     #[test]
     fn vmsk_round_trip() {
-        let mut mask = LayerVectorMask::default();
-        mask.invert = Some(true);
-        mask.disable = Some(false);
-        mask.fill_starts_with_all_pixels = Some(true);
-        mask.paths.push(BezierPath {
-            open: false,
-            operation: Some(BooleanOperation::Combine),
-            knots: vec![
-                BezierKnot { linked: true, points: vec![10.0, 20.0, 11.0, 21.0, 12.0, 22.0] },
-                BezierKnot { linked: false, points: vec![30.0, 40.0, 31.0, 41.0, 32.0, 42.0] },
-            ],
-            fill_rule: FillRule::NonZero,
-        });
+        let mask = LayerVectorMask {
+            invert: Some(true),
+            disable: Some(false),
+            fill_starts_with_all_pixels: Some(true),
+            paths: vec![BezierPath {
+                open: false,
+                operation: Some(BooleanOperation::Combine),
+                knots: vec![
+                    BezierKnot { linked: true, points: vec![10.0, 20.0, 11.0, 21.0, 12.0, 22.0] },
+                    BezierKnot { linked: false, points: vec![30.0, 40.0, 31.0, 41.0, 32.0, 42.0] },
+                ],
+                fill_rule: FillRule::NonZero,
+            }],
+            ..Default::default()
+        };
 
-        let mut info = LayerAdditionalInfo::default();
-        info.vector_mask = Some(mask);
+        let info = LayerAdditionalInfo {
+            vector_mask: Some(mask),
+            ..Default::default()
+        };
 
         // write
         let w_opts = WriteOptions::default();
@@ -670,12 +674,14 @@ mod tests {
 
     #[test]
     fn soco_round_trip() {
-        let mut info = LayerAdditionalInfo::default();
-        info.vector_fill = Some(VectorContent::Color(Color::Rgb(Rgb {
-            r: 12.0,
-            g: 34.0,
-            b: 56.0,
-        })));
+        let info = LayerAdditionalInfo {
+            vector_fill: Some(VectorContent::Color(Color::Rgb(Rgb {
+                r: 12.0,
+                g: 34.0,
+                b: 56.0,
+            }))),
+            ..Default::default()
+        };
 
         assert_eq!(has("SoCo", &info), Some(true));
 

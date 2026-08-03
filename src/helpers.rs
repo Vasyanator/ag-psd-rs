@@ -13,6 +13,14 @@ Main responsibilities:
 - зеркалировать соответствующий upstream-модуль при портировании;
 - держать публичный контракт этого участка в одном месте.
 
+Descriptor enum decoding (`EnumCodec`, `enum_long_form_to_key`):
+Photoshop 2026 writes descriptor enum values in long form (the map KEY, e.g.
+`BlnM.normal`, camelCased when the key is multi-word: `BlnM.colorBurn`) instead of
+the historical 4-character code (`BlnM.Nrml`). `EnumCodec::decode` accepts code,
+key and camelCased key, in that order, before erroring; `enum_long_form_to_key`
+is the shared camelCase -> spaced-lowercase normalizer, also used by the typed
+enum tables in `additional_info::effects_keys`.
+
 PORT STATUS: ported except browser-canvas concerns
   (create_canvas / create_image_data / image_data_to_canvas / create_canvas_from_data /
    initialize_canvas стабированы под модель PixelData, см. пометки ниже).
@@ -73,8 +81,14 @@ pub fn to_blend_mode(key: &str) -> Option<BlendMode> {
 /// upstream `fromBlendMode` (построен через
 /// `Object.keys(toBlendMode).forEach(key => fromBlendMode[toBlendMode[key]] = key)`):
 /// BlendMode -> 4-символьный ключ. Это обратное отображение `to_blend_mode`.
-pub fn from_blend_mode(mode: BlendMode) -> &'static str {
-    match mode {
+///
+/// Returns `None` for the descriptor-only modes (`linear height`, `height`,
+/// `subtraction`), which have no entry in the legacy signature table — the JS
+/// dictionary lookup yields `undefined` there and every call site substitutes its own
+/// default (`'norm'`, or `'pass'` for a section divider).
+#[must_use]
+pub fn from_blend_mode(mode: BlendMode) -> Option<&'static str> {
+    Some(match mode {
         BlendMode::PassThrough => "pass",
         BlendMode::Normal => "norm",
         BlendMode::Dissolve => "diss",
@@ -103,7 +117,9 @@ pub fn from_blend_mode(mode: BlendMode) -> &'static str {
         BlendMode::Saturation => "sat ",
         BlendMode::Color => "colr",
         BlendMode::Luminosity => "lum ",
-    }
+        // Not present in upstream `toBlendMode`, therefore absent from `fromBlendMode`.
+        BlendMode::LinearHeight | BlendMode::Height | BlendMode::Subtraction => return None,
+    })
 }
 
 /// upstream `layerColors`.
@@ -142,6 +158,25 @@ pub fn rev_map(map: &Dict) -> Dict {
     result
 }
 
+/// Normalizes a Photoshop 2026 long-form enum id into the space-separated map-key
+/// spelling used by the descriptor enum tables: `colorBurn` -> `color burn`.
+///
+/// Faithful port of upstream `value.replace(/([A-Z])/g, ' $1').toLowerCase()`: a space
+/// is inserted before every *ASCII* uppercase letter (so a leading capital yields a
+/// leading space, exactly as upstream), and the whole string is then lowercased.
+#[must_use]
+pub fn enum_long_form_to_key(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 4);
+    for ch in value.chars() {
+        if ch.is_ascii_uppercase() {
+            out.push(' ');
+        }
+        // `to_lowercase` (not `to_ascii_lowercase`) mirrors JS `toLowerCase()`.
+        out.extend(ch.to_lowercase());
+    }
+    out
+}
+
 /// upstream `createEnum<T>`: возвращает пару (decode, encode) для дескрипторного
 /// enum вида `prefix.value`. Так как в Rust замыкания неудобно возвращать парой,
 /// предоставляем структуру с теми же decode/encode.
@@ -154,7 +189,19 @@ pub struct EnumCodec {
 
 impl EnumCodec {
     /// upstream `createEnum(prefix, def, map)`.
+    ///
+    /// `def` MUST be a *key* of `map`, never one of its values: [`EnumCodec::encode`]
+    /// resolves `None` through `map[def]`, so a default that is not a key silently
+    /// emits an empty code. Upstream enforces this through the type system
+    /// (`createEnum<T extends string>(prefix, def: T, map: { [K in T]: string })`);
+    /// Rust has no equivalent for a runtime `HashMap`, so the invariant is checked with
+    /// a debug assertion — a contract violation is a programming error in the codec
+    /// table, not a condition callers can recover from.
     pub fn new(prefix: &str, def: &str, map: Dict) -> Self {
+        debug_assert!(
+            map.contains_key(def),
+            "EnumCodec '{prefix}': default '{def}' is not a key of the map"
+        );
         let rev = rev_map(&map);
         EnumCodec {
             prefix: prefix.to_string(),
@@ -164,12 +211,35 @@ impl EnumCodec {
         }
     }
 
+    /// True when the configured default is a valid key of the map.
+    ///
+    /// Mirrors the invariant asserted in [`EnumCodec::new`]; exposed so that modules
+    /// owning codec tables can prove it for every codec they construct in a test.
+    #[must_use]
+    pub fn default_is_valid(&self) -> bool {
+        self.map.contains_key(&self.def)
+    }
+
     /// upstream `decode(val)`: `val.split('.')[1]` -> reverse-lookup -> def.
     /// Бросает (Err) при нераспознанном непустом значении.
+    ///
+    /// Photoshop 2026 stopped writing the historical 4-character code (the map *value*,
+    /// e.g. `BlnM.Nrml`) and writes the long-form id instead. Two shapes occur:
+    /// single-word values use the map *key* verbatim (`BlnM.normal`), multi-word values
+    /// use a camelCase id whose map key is space-separated (`BlnM.colorBurn` ->
+    /// `color burn`). Both are accepted here, in that order, before erroring — without
+    /// this, every descriptor enum in a file saved by Photoshop 2026 fails to read.
     pub fn decode(&self, val: &str) -> Result<String, String> {
         // val.split('.')[1] — второй сегмент (может отсутствовать => "").
         let value = val.split('.').nth(1).unwrap_or("");
         if !value.is_empty() && !self.rev.contains_key(value) {
+            if self.map.contains_key(value) {
+                return Ok(value.to_string());
+            }
+            let spaced = enum_long_form_to_key(value);
+            if self.map.contains_key(&spaced) {
+                return Ok(spaced);
+            }
             return Err(format!("Unrecognized value for enum: '{val}'"));
         }
         Ok(self
@@ -236,11 +306,15 @@ pub enum MaskParams {
 // ===========================================================================
 
 /// upstream `ChannelData`.
+///
+/// Field names follow upstream v31, which renamed `channelId -> id` and
+/// `buffer -> data`.
 #[derive(Debug, Clone)]
 pub struct ChannelData {
-    pub channel_id: ChannelId,
+    pub id: ChannelId,
     pub compression: Compression,
-    pub buffer: Option<Vec<u8>>,
+    /// Encoded channel payload, `None` when the channel has no bytes to write.
+    pub data: Option<Vec<u8>>,
     pub length: usize,
 }
 
@@ -382,6 +456,12 @@ pub fn write_data_raw(data: &PixelData, offset: usize, width: usize, height: usi
 /// upstream `writeDataRLE(buffer, { data, width, height }, offsets, large)`.
 /// Сжимает каналы по PackBits, как в оригинале (включая раскладку length-таблицы
 /// в начале буфера). Возвращает срез использованной части буфера.
+///
+/// `buffer` must hold `offsets.len() * (height * entry + 2 * width * height)`
+/// bytes, where `entry` is 4 when `large` (PSB row lengths) and 2 otherwise —
+/// see `writer::rle_scratch_size`. A shorter buffer does not error: writes past
+/// its end are dropped and the result is truncated, mirroring upstream's
+/// `Uint8Array`.
 pub fn write_data_rle(
     buffer: &mut [u8],
     data_pixels: &PixelData,
@@ -403,10 +483,12 @@ pub fn write_data_rle(
 
     // upstream writes into a `Uint8Array`; writing past its end is a silent
     // no-op in JS (the value is simply dropped), and `buffer.slice(0, o)` later
-    // returns only the bytes that fit. The buffer is sized by an estimate that
-    // can be too small for tiny images (e.g. 1x1 with alpha), so faithfully
-    // mirror the TypedArray semantics by ignoring out-of-bounds writes instead
-    // of panicking. `o`/`ol` still advance so the returned length matches TS.
+    // returns only the bytes that fit. Mirroring those TypedArray semantics
+    // keeps a caller-supplied short buffer from panicking; `o`/`ol` still
+    // advance so the returned length matches TS. Note that this makes an
+    // undersized buffer produce silently truncated output, so callers inside
+    // this crate must size it from `writer::rle_scratch_size`, which is a
+    // proven bound for both PSD and PSB row-length tables.
     macro_rules! set {
         ($buf:expr, $idx:expr, $val:expr) => {{
             let idx = $idx as usize;
@@ -655,17 +737,29 @@ mod tests {
             BlendMode::Luminosity,
         ];
         for mode in all {
-            let key = from_blend_mode(mode);
+            // `expect` takes a plain &str and would print the braces literally,
+            // so format the mode explicitly.
+            let key = from_blend_mode(mode)
+                .unwrap_or_else(|| panic!("legacy signature exists for {mode:?}"));
             assert_eq!(key.len(), 4, "key must be 4 chars: {key:?}");
             assert_eq!(to_blend_mode(key), Some(mode), "round trip failed for {key:?}");
         }
     }
 
     #[test]
+    fn descriptor_only_blend_modes_have_no_legacy_signature() {
+        // Upstream `toBlendMode` has no code for these, so `fromBlendMode[mode]` is
+        // `undefined` and every call site substitutes its own default.
+        assert_eq!(from_blend_mode(BlendMode::LinearHeight), None);
+        assert_eq!(from_blend_mode(BlendMode::Height), None);
+        assert_eq!(from_blend_mode(BlendMode::Subtraction), None);
+    }
+
+    #[test]
     fn blend_mode_spacey_keys() {
         assert_eq!(to_blend_mode("mul "), Some(BlendMode::Multiply));
         assert_eq!(to_blend_mode("div "), Some(BlendMode::ColorDodge));
-        assert_eq!(from_blend_mode(BlendMode::Luminosity), "lum ");
+        assert_eq!(from_blend_mode(BlendMode::Luminosity), Some("lum "));
         assert_eq!(to_blend_mode("nope"), None);
     }
 
@@ -795,5 +889,66 @@ mod tests {
         // empty second segment -> default
         assert_eq!(codec.decode("Enum").unwrap(), "alpha");
         assert!(codec.decode("Enum.Zzzz").is_err());
+    }
+
+    /// A `BlnM`-shaped codec: single-word and multi-word keys, historical codes.
+    fn bln_m_like() -> EnumCodec {
+        let map: Dict = [
+            ("normal", "Nrml"),
+            ("color burn", "CBrn"),
+            ("linear burn", "linearBurn"),
+        ]
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+        EnumCodec::new("BlnM", "normal", map)
+    }
+
+    #[test]
+    fn enum_codec_decodes_historical_four_char_code() {
+        // Every Photoshop up to 2025 writes the map VALUE; this must keep working.
+        let codec = bln_m_like();
+        assert_eq!(codec.decode("BlnM.Nrml").unwrap(), "normal");
+        assert_eq!(codec.decode("BlnM.CBrn").unwrap(), "color burn");
+        assert_eq!(codec.decode("BlnM.linearBurn").unwrap(), "linear burn");
+    }
+
+    #[test]
+    fn enum_codec_decodes_photoshop_2026_long_form_key() {
+        // Photoshop 2026 writes the map KEY verbatim for single-word values.
+        let codec = bln_m_like();
+        assert_eq!(codec.decode("BlnM.normal").unwrap(), "normal");
+    }
+
+    #[test]
+    fn enum_codec_decodes_photoshop_2026_camel_case_long_form() {
+        // Multi-word values arrive camelCased: 'colorBurn' -> 'color burn'.
+        let codec = bln_m_like();
+        assert_eq!(codec.decode("BlnM.colorBurn").unwrap(), "color burn");
+    }
+
+    #[test]
+    fn enum_codec_still_rejects_a_genuinely_unknown_value() {
+        let codec = bln_m_like();
+        let err = codec.decode("BlnM.wibbleWobble").unwrap_err();
+        assert!(err.contains("Unrecognized value for enum"), "{err}");
+        // A camelCase id whose normalized form is still unknown must not be accepted.
+        assert!(codec.decode("BlnM.Zzzz").is_err());
+    }
+
+    #[test]
+    fn enum_codec_reports_an_invalid_default() {
+        // `EnumCodec::new` debug-asserts this; `default_is_valid` lets codec-owning
+        // modules prove the invariant for their own tables without a panic.
+        assert!(bln_m_like().default_is_valid());
+    }
+
+    #[test]
+    fn enum_long_form_to_key_matches_the_upstream_regex() {
+        assert_eq!(enum_long_form_to_key("colorBurn"), "color burn");
+        assert_eq!(enum_long_form_to_key("normal"), "normal");
+        // A leading capital yields a leading space, exactly like `' $1'` upstream.
+        assert_eq!(enum_long_form_to_key("ColorBurn"), " color burn");
+        assert_eq!(enum_long_form_to_key(""), "");
     }
 }

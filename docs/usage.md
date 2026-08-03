@@ -7,6 +7,8 @@ overview, capabilities, and status, see the [README](../README.md).
 - [Reading a PSD](#reading-a-psd)
   - [ReadOptions](#readoptions)
   - [Where the pixels go: `canvas` vs `image_data`](#where-the-pixels-go-canvas-vs-image_data)
+  - [Memory limits](#memory-limits)
+  - [Lazy bitmaps: decoding on demand](#lazy-bitmaps-decoding-on-demand)
   - [Walking the layer tree](#walking-the-layer-tree)
   - [Error handling](#error-handling)
 - [Writing a PSD](#writing-a-psd)
@@ -35,6 +37,7 @@ A `Psd` is a tree:
 Psd
 ├─ width / height / color_mode / channels / bits_per_channel
 ├─ canvas | image_data           (composite pixels, RGBA8)
+├─ raw_composite_data            (undecoded composite, with `use_raw_data`)
 ├─ image_resources               (ICC profile, guides, slices, …)
 └─ children: Vec<Layer>
    └─ Layer
@@ -42,6 +45,7 @@ Psd
       ├─ top / left / bottom / right
       ├─ blend_mode / opacity / hidden / clipping
       ├─ canvas | image_data      (this layer's pixels, RGBA8)
+      ├─ raw_data                 (undecoded channels, with `use_raw_data`)
       └─ children: Vec<Layer>     (present when this layer is a group)
 ```
 
@@ -75,8 +79,9 @@ println!("bits/channel: {:?}", psd.bits_per_channel);
 
 ### ReadOptions
 
-All fields are `Option<bool>` and default to "off" (`None`). Set the ones you
-need:
+Every flag is an `Option<bool>` that defaults to "off" (`None`). The one
+exception is `total_memory_limit`, whose default is **not** `None` — see
+[Memory limits](#memory-limits). Set the ones you need:
 
 | Field | Effect |
 | --- | --- |
@@ -84,8 +89,9 @@ need:
 | `skip_composite_image_data` | Don't decode the flattened composite image. |
 | `skip_thumbnail` | Don't decode the embedded thumbnail. |
 | `skip_linked_files_data` | Don't load smart-object linked file payloads. |
+| `total_memory_limit` | `Option<usize>`: cumulative byte budget for decoded bitmaps. `None` = unlimited; the default is 2 GiB. |
 | `use_image_data` | Put decoded pixels into `image_data` instead of `canvas`. |
-| `use_raw_data` | Keep raw, undecoded channel bytes (`layer.raw_data`). |
+| `use_raw_data` | Keep raw, undecoded channel bytes (`Layer::raw_data`, `Psd::raw_composite_data`) and decode later. |
 | `use_raw_thumbnail` | Keep the thumbnail as raw bytes instead of decoding it. |
 | `throw_for_missing_features` | Return an error when an unsupported feature is found. |
 | `log_missing_features` / `log_dev_features` | Diagnostic logging flags. |
@@ -97,6 +103,7 @@ Example — read metadata only, as fast as possible:
 use ag_psd::read_psd;
 use ag_psd::psd::ReadOptions;
 
+# let bytes: Vec<u8> = Vec::new();
 let opts = ReadOptions {
     skip_layer_image_data: Some(true),
     skip_composite_image_data: Some(true),
@@ -104,7 +111,6 @@ let opts = ReadOptions {
     ..Default::default()
 };
 let psd = read_psd(&bytes, &opts).unwrap();
-# let bytes: Vec<u8> = Vec::new();
 ```
 
 ### Where the pixels go: `canvas` vs `image_data`
@@ -128,6 +134,7 @@ So to read pixels, pick one and stick with it:
 use ag_psd::read_psd;
 use ag_psd::psd::ReadOptions;
 
+# let bytes: Vec<u8> = Vec::new();
 let opts = ReadOptions { use_image_data: Some(true), ..Default::default() };
 let psd = read_psd(&bytes, &opts).unwrap();
 
@@ -137,8 +144,135 @@ if let Some(px) = &psd.image_data {
     let first_pixel = &px.data[0..4]; // [r, g, b, a]
     println!("{w}x{h}, first pixel = {first_pixel:?}");
 }
-# let bytes: Vec<u8> = Vec::new();
 ```
+
+### Memory limits
+
+A PSD canvas may declare up to 300000×300000 pixels with no limit on layer
+count, and a file can declare huge layers without containing any matching data.
+Decoding such a document naively needs terabytes of RAM. To make that survivable,
+`ReadOptions` carries a **cumulative byte budget for decoded bitmaps and decode
+scratch buffers**:
+
+```rust
+use ag_psd::DEFAULT_TOTAL_MEMORY_LIMIT;
+use ag_psd::psd::ReadOptions;
+
+// The default: 2 GiB, i.e. `Some(DEFAULT_TOTAL_MEMORY_LIMIT)`.
+let bounded = ReadOptions::default();
+
+// A tighter ceiling.
+let tight = ReadOptions {
+    total_memory_limit: Some(256 * 1024 * 1024),
+    ..Default::default()
+};
+
+// No limit at all — only for files you produced or otherwise trust.
+let unlimited = ReadOptions { total_memory_limit: None, ..Default::default() };
+# let _ = (bounded, tight, unlimited, DEFAULT_TOTAL_MEMORY_LIMIT);
+```
+
+Consequences worth knowing:
+
+- `ReadOptions::default()` is **not** an all-`None` value. If you match on it or
+  construct it field by field, remember this one field.
+- Exceeding the budget aborts the read with `ReadError::ExceededMemoryLimit`. A
+  genuinely large document that used to read fine can now fail; raise the limit
+  or set it to `None`.
+- Layer, mask, real-mask and pattern rectangles are validated as they are read:
+  inverted rectangles, and sides above 30000 (300000 for PSB), give
+  `ReadError::InvalidBoxSize`.
+- The budget applies to the eager read path only. Bitmaps you decode yourself
+  through the lazy API below are not charged against it — you are in control of
+  the pacing there.
+
+### Lazy bitmaps: decoding on demand
+
+With `use_raw_data`, the reader parses the full document structure but keeps the
+compressed channel bytes instead of decoding them: they land in
+`Layer::raw_data` and `Psd::raw_composite_data`. Five free functions then decode
+one bitmap at a time:
+
+| Function | Decodes |
+| --- | --- |
+| `get_layer_image_data(&Layer)` | the layer's own bitmap |
+| `get_layer_mask_image_data(&Layer)` | the layer's user mask |
+| `get_layer_real_mask_image_data(&Layer)` | the layer's vector-derived mask |
+| `get_composite_image_data(&Psd)` | the flattened composite |
+| `decode_layer_pixels(&mut Layer, use_image_data)` | all of a layer's bitmaps, in place, dropping `raw_data` |
+
+The first four borrow immutably and return a fresh `PixelData` (or `Ok(None)`
+when there is nothing to decode), so the peak cost is one bitmap rather than the
+whole document.
+
+This is the recommended way to handle **untrusted, user-provided files**: read
+the structure only, validate the declared sizes against your own limits, then
+decode layer by layer.
+
+```rust
+use ag_psd::{read_psd, get_layer_image_data};
+use ag_psd::psd::{Layer, ReadOptions};
+use ag_psd::ReadError;
+
+# fn run(bytes: &[u8]) -> Result<(), String> {
+// 1. Structure only — no bitmap is decoded here.
+let opts = ReadOptions {
+    use_raw_data: Some(true),
+    use_raw_thumbnail: Some(true),
+    ..Default::default()
+};
+let psd = read_psd(bytes, &opts).map_err(|e| e.to_string())?;
+
+// 2. Check the document against your own environment limits.
+if psd.width > 10000.0 || psd.height > 10000.0 {
+    return Err("document too large".to_string());
+}
+if psd.bits_per_channel.unwrap_or(8.0) > 8.0 {
+    return Err("only 8-bit color data is supported".to_string());
+}
+
+// 3. Walk the tree, validate each layer, and decode one bitmap at a time.
+fn process(layer: &Layer, total: &mut usize) -> Result<(), String> {
+    *total += 1;
+    if *total > 100 {
+        return Err("too many layers".to_string());
+    }
+
+    // Layer bounds are independent of the document size and can exceed it.
+    let width = layer.right.unwrap_or(0.0) - layer.left.unwrap_or(0.0);
+    let height = layer.bottom.unwrap_or(0.0) - layer.top.unwrap_or(0.0);
+    if width > 10000.0 || height > 10000.0 {
+        return Err("layer too large".to_string());
+    }
+
+    match get_layer_image_data(layer) {
+        // Use the pixels, then let them drop: only one layer bitmap is alive
+        // at a time.
+        Ok(Some(px)) => println!("{}x{} decoded", px.width, px.height),
+        Ok(None) => {}
+        Err(ReadError::ExceededMemoryLimit { .. }) => return Err("too big".to_string()),
+        Err(e) => return Err(e.to_string()),
+    }
+
+    for child in layer.children.iter().flatten() {
+        process(child, total)?;
+    }
+    Ok(())
+}
+
+let mut total = 0usize;
+for layer in psd.children.iter().flatten() {
+    process(layer, &mut total)?;
+}
+# Ok(())
+# }
+```
+
+Two further precautions, inherited from upstream's production guidance:
+
+- Queue documents rather than decoding many in parallel; each one can still cost
+  a lot of memory and time.
+- Reading is synchronous and can be slow. Run it off your UI/main thread.
 
 ### Walking the layer tree
 
@@ -174,19 +308,42 @@ Useful per-layer fields:
 
 ### Error handling
 
-`read_psd` returns `Result<Psd, ag_psd::reader::ReadError>`. Match on it for
-robust handling:
+`read_psd` returns `Result<Psd, ReadError>` (`ag_psd::ReadError`, re-exported
+from the `reader` module). Match on it for robust handling:
 
 ```rust
 use ag_psd::read_psd;
 use ag_psd::psd::ReadOptions;
+use ag_psd::ReadError;
 
+# let bytes: Vec<u8> = Vec::new();
 match read_psd(&bytes, &ReadOptions::default()) {
     Ok(psd) => { /* … */ }
-    Err(e) => eprintln!("could not read PSD: {e:?}"),
+    Err(ReadError::ExceededMemoryLimit { requested, available }) => {
+        eprintln!("needs {requested} bytes, only {available} left in the budget");
+    }
+    Err(ReadError::InvalidBoxSize { kind, width, height }) => {
+        eprintln!("malformed {kind} rectangle: {width}x{height}");
+    }
+    Err(e) => eprintln!("could not read PSD: {e}"),
 }
-# let bytes: Vec<u8> = Vec::new();
 ```
+
+The variants are:
+
+| Variant | Meaning |
+| --- | --- |
+| `UnexpectedEndOfBuffer` | A read ran past the end of the input. |
+| `ReadingPastEndOfFile` | A declared length is implausibly large (>100 MB guard). |
+| `InvalidSignature { .. }` | A section signature did not match what the format requires. |
+| `SizeTooLarge` | A section declares more than 4 GB. |
+| `SectionExceedsFileSize` | A section reaches past the end of the file. |
+| `StrictViolation(..)` | An unsupported feature, or a strict-mode consistency check. |
+| `ExceededMemoryLimit { .. }` | The bitmap budget ran out — see [Memory limits](#memory-limits). |
+| `InvalidBoxSize { .. }` | A layer/mask/real-mask/pattern rectangle is inverted or too large. |
+
+`ReadError` implements `Display` and `std::error::Error`, so `{e}` gives a
+human-readable message and it composes with `Box<dyn Error>` / `anyhow`.
 
 CMYK documents are rejected at the header; 16/32-bit, grayscale, indexed and
 bitmap modes read fine.
@@ -345,7 +502,7 @@ The port includes the auxiliary Adobe parsers that ship with upstream `ag-psd`:
 
 ```rust
 use ag_psd::{read_abr, read_csh, write_csh, read_ase, write_ase};
-use ag_psd::psd::ReadAbrOptions; // ReadAbrOptions is re-exported at the crate root
+use ag_psd::ReadAbrOptions; // re-exported at the crate root, from the `abr` module
 
 // Brushes (.abr) — read only
 let abr = read_abr(&std::fs::read("brushes.abr")?, &ReadAbrOptions::default()).unwrap();
@@ -373,10 +530,13 @@ You can parse and re-serialize it directly:
 use ag_psd::{parse_engine_data, serialize_engine_data};
 
 # let raw: Vec<u8> = Vec::new();
-let value = parse_engine_data(&raw)?;        // -> EngineValue tree
-let bytes = serialize_engine_data(&value);   // -> Vec<u8>
+let value = parse_engine_data(&raw)?;               // -> EngineValue tree
+let bytes = serialize_engine_data(&value, false);   // -> Vec<u8>
 # Ok::<(), ag_psd::EngineDataError>(())
 ```
+
+The second argument of `serialize_engine_data` selects the condensed
+(single-line) layout; pass `false` for the indented form Photoshop writes.
 
 There is also `decode_engine_data2` for the v2 variant. This is a low-level API;
 most users will interact with text through `LayerAdditionalInfo.text` instead.
@@ -394,5 +554,10 @@ most users will interact with text through `LayerAdditionalInfo.text` instead.
   `shmd` timeline/comps, thumbnail generation, link groups, `Txt2` text paths.
   These weren't needed for the original use case; open an issue if you need them.
 - Opacity is **0.0–1.0**, not 0–255.
+- **`ReadOptions::default()` carries a 2 GiB bitmap budget**, so it is not an
+  all-`None` value and a very large document can fail with
+  `ReadError::ExceededMemoryLimit`. Set `total_memory_limit: None` to opt out,
+  or use the [lazy bitmap API](#lazy-bitmaps-decoding-on-demand) to stay bounded
+  without a hard ceiling.
 - This is a vibe-coded port (see the README): well tested against fixtures, but
   not line-by-line human-audited. Verify critical output in real Photoshop.

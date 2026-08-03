@@ -1,61 +1,119 @@
-# Crate: ag-psd (Rust port)
+# Module: crates/ag-psd
 
-## Назначение
-Самостоятельный workspace-крейт с переносом TypeScript-библиотеки `ag-psd`
-(чтение/запись PSD-файлов Photoshop) на Rust «с нуля». Сейчас крейт находится в
-стадии каркаса: публичный API и разбиение на модули объявлены, но реальная
-логика ещё не портирована.
+## Purpose
 
-Крейт намеренно standalone и НЕ подключён как зависимость корневого бинарника
-`manhwastudio_rs`. Подключение произойдёт позже, когда reader/writer будут
-готовы.
+Standalone Rust port of the TypeScript library
+[`ag-psd`](https://github.com/Agamnentzar/ag-psd): reading and writing Adobe
+Photoshop `.psd`/`.psb` documents, plus the companion Adobe formats that ship
+with upstream (`.abr`, `.csh`, `.ase`, Engine Data).
 
-## Эталон (spec)
-Эталоном является оригинальная TS-библиотека в `test/ag-psd` (только для чтения):
-- исходники-спецификация: `test/ag-psd/src/*.ts`;
-- фикстуры для тестов: `test/ag-psd/test` (пары `read/<name>/src.psd` + `data.json`).
+The crate is **published on crates.io as `ag-psd`** and consumed from there by
+the ManhwaStudio application as an ordinary registry dependency. It is not a
+member of the ManhwaStudio cargo workspace: it lives inside that checkout for
+convenience only, is its own git repository
+(`https://github.com/Vasyanator/ag-psd-rs`), and carries an empty `[workspace]`
+table in `Cargo.toml` to opt out of any parent workspace. Build and test it from
+inside this directory.
 
-## Политика портирования
-- **Порт по необходимости** (port on demand): модули наполняются логикой только
-  тогда, когда они реально нужны следующему шагу, а не все сразу.
-- **Зеркалирование разбиения 1:1**: каждому исходному файлу `*.ts` соответствует
-  ровно один `*.rs`-модуль с тем же набором ответственности. Имена приводятся к
-  `snake_case`.
-- **Сначала запись, потом чтение** (write path first, then reader): порт начинаем
-  с пути записи (`writer.rs` + сериализация в `psd.rs`/секции), затем делаем
-  обратный путь чтения. Это даёт возможность генерировать валидные PSD и
-  проверять их сторонними инструментами до готовности reader.
+## Reference specification
 
-## Карта модулей (TS -> Rust)
-| Upstream `*.ts`        | Rust модуль            | Назначение |
-| ---------------------- | ---------------------- | ---------- |
-| `psdWriter.ts`         | `writer.rs`            | низкоуровневая запись байтов в буфер PSD |
-| `psdReader.ts`         | `reader.rs`            | низкоуровневое чтение байтов из буфера PSD |
-| `descriptor.ts`        | `descriptor.rs`        | дескрипторы Photoshop (Action Descriptor) |
-| `engineData.ts`        | `engine_data.rs`       | парсер/сериализатор Engine Data (текст) |
-| `engineData2.ts`       | `engine_data2.rs`      | вариант Engine Data v2 |
-| `text.ts`              | `text.rs`              | работа с текстовыми слоями |
-| `additionalInfo.ts`    | `additional_info.rs`   | additional layer information блоки |
-| `imageResources.ts`    | `image_resources.rs`   | image resource блоки |
-| `effectsHelpers.ts`    | `effects_helpers.rs`   | вспомогательные функции эффектов слоёв |
-| `helpers.ts`           | `helpers.rs`           | общие хелперы (в т.ч. `initialize_canvas`) |
-| `initializeCanvas.ts`  | `initialize_canvas.rs` | инициализация canvas-фабрики (зеркало upstream) |
-| `utf8.ts`              | `utf8.rs`              | кодирование/декодирование UTF-8 |
-| `psd.ts`               | `psd.rs`               | главные типы документа `Psd` + оркестрация чтения/записи |
-| `abr.ts`               | `abr.rs`               | чтение кистей Photoshop (.abr) |
-| `csh.ts`               | `csh.rs`               | чтение custom shapes (.csh) |
-| `ase.ts`               | `ase.rs`               | палитры Adobe Swatch Exchange (.ase) |
-| `jpeg.ts`              | `jpeg.rs`              | работа с JPEG-данными внутри PSD |
-| `index.ts`             | `lib.rs`               | публичные re-export'ы и точки входа |
+The upstream TypeScript library in `test/ag-psd` (READ-ONLY) is the
+specification:
 
-## Файлы
-- `lib.rs`: корень крейта; объявляет `pub mod ...;` для всех модулей и сводит
-  публичные re-export'ы (зеркало `index.ts`).
-- `src/*.rs`: модули по таблице выше; каждый начинается с FILE HEADER-комментария
-  и пометки `// PORT STATUS: stub — not yet ported`.
-- `tests/fixtures.rs`: каркас интеграционного теста, который позднее будет
-  round-trip-проверять `src.psd` против `data.json` из `test/ag-psd/test`.
+- `test/ag-psd/src/*.ts` — behavioural spec, ported module-for-module;
+- `test/ag-psd/test/` — fixtures (`read/<name>/src.psd` + `data.json`) used as
+  the oracle by `tests/fixtures.rs`.
 
-## Тестирование
-- `cargo build -p ag-psd` — крейт должен собираться на любом этапе.
-- `cargo test -p ag-psd` — фикстурные тесты (пока `#[ignore]`).
+The port mirrors the upstream module split 1:1, with names converted to
+`snake_case`. Any deliberate divergence from upstream must be commented at the
+site where it happens and recorded in `CHANGELOG.md`.
+
+## Architecture
+
+```text
+lib.rs                       crate root: module declarations + public re-exports
+  psd.rs                     shared document model (Psd/Layer/ReadOptions/…)
+  reader.rs   writer.rs      byte-level IO + whole-document orchestration
+  additional_info/           8BIM/8B64 layer-info sections (directory module)
+  image_resources.rs  descriptor.rs  engine_data*.rs  text.rs
+  effects_helpers.rs  helpers.rs  utf8.rs  jpeg.rs
+  abr.rs  csh.rs  ase.rs      companion Adobe formats
+```
+
+Data flow on read: `read_psd` drives `reader.rs`, which decodes the header,
+layer records, channel bitmaps and every section handler, filling one shared
+`psd::Psd` value. Writing is the exact mirror through `writer.rs`. Every section
+decoder depends on `psd.rs` for its types and on `reader.rs`/`writer.rs` for
+primitives; nothing depends on `lib.rs`. The per-file map lives in
+`src/MODULE_README.md`.
+
+## Files and submodules
+
+- `src/` — the library itself; see `src/MODULE_README.md`.
+- `tests/fixtures.rs` — integration harness that reads and round-trips the
+  upstream fixture corpus when it is present on disk, and compares the parse
+  against the `data.json` ground truth upstream ships with it. Expected failures
+  are pinned as explicit allowlists, so both a new failure and a newly passing
+  allowlisted fixture turn the suite red.
+- `docs/usage.md` — the user-facing guide. Excluded from the published package
+  by `Cargo.toml` `exclude`, so links to it from `README.md` must be absolute
+  URLs into the GitHub repository.
+- `README.md` — crates.io / docs.rs front page.
+- `CHANGELOG.md` — release history, including the upstream version this port is
+  synced to.
+
+## Contracts and invariants
+
+- **Memory budget.** `psd::ReadOptions::total_memory_limit` is a byte budget for
+  bitmaps and decode scratch buffers; `None` means unlimited and
+  `ReadOptions::default()` carries `psd::DEFAULT_TOTAL_MEMORY_LIMIT` (2 GiB).
+  Every allocation on the read path charges against the remaining budget and an
+  overrun returns `reader::ReadError::ExceededMemoryLimit`. Because of this,
+  `ReadOptions` implements `Default` by hand — it is *not* an all-`None` value.
+  Scratch charges are refunded when the buffer dies, error path included.
+- **Box validation.** Layer, mask, real-mask and pattern rectangles are validated
+  immediately after they are read; an inverted rectangle or a side above 30000
+  (300000 for PSB) returns `reader::ReadError::InvalidBoxSize`. Patterns go
+  through one shared reader (`reader::read_pattern`) so that this check and the
+  memory budget cover every caller — the document keys and ABR alike.
+- **Lazy bitmaps.** With `ReadOptions::use_raw_data` the reader keeps undecoded
+  channel bytes in `Layer::raw_data` / `Psd::raw_composite_data` instead of
+  decoding them. The free functions `reader::{get_layer_image_data,
+  get_layer_mask_image_data, get_layer_real_mask_image_data,
+  get_composite_image_data, decode_layer_pixels}` decode one bitmap at a time.
+  This is the intended path for untrusted input: read structure, validate sizes,
+  then decode layer by layer.
+- **Errors.** The read path returns the typed `reader::ReadError` and must never
+  panic on malformed input; index and size arithmetic is checked. The write path
+  is infallible by design and reproduces upstream's silently-truncating buffer
+  semantics, so writer scratch buffers must be sized correctly rather than
+  guarded at use time: `writer::rle_scratch_size` is the single source of that
+  size, and its doc comment explains the PSB row-length entry width — 4 bytes,
+  where upstream hardcodes 2 — which is a deliberate divergence.
+- **Byte order and framing.** PSD is big-endian; padding, section framing and
+  key ordering are byte-exact against upstream.
+- **Writer scope.** Writing is 8-bit RGB only, faithful to upstream. Other modes
+  and depths can be read but are not re-emitted in their original form.
+- **Public API.** The crate root mirrors upstream `index.ts`. Symbols with no
+  upstream counterpart (`write_csh`, `write_ase`) are marked as such at their
+  declaration.
+- **Toolchain.** Edition 2024, MSRV 1.85, `flate2` as the only runtime
+  dependency. Adding a dependency is an architectural decision, not a
+  convenience.
+- **Never run `cargo fmt` / `rustfmt` in this repository.** The layout is
+  hand-maintained; a formatting pass produces an unreviewable diff.
+- **Tests must survive packaging.** The upstream fixture tree is not part of the
+  published crate, so any test that needs it has to skip gracefully when it is
+  absent instead of failing or panicking.
+
+## Editing map
+
+- To change the document model, or add a field visible to users, see `src/psd.rs`
+  — then update both the reader and the writer, and `CHANGELOG.md`.
+- To change decoding/encoding of a specific PSD section, find its module in
+  `src/MODULE_README.md`; layer-info keys live in `src/additional_info/`.
+- To change the public surface or the crate-level docs, see `src/lib.rs`.
+- To sync a new upstream release, diff `test/ag-psd/src/` between the two
+  upstream tags and apply module by module; record the sync in `CHANGELOG.md`.
+- To change user-facing documentation, see `README.md` (overview, API table,
+  status) and `docs/usage.md` (guide, examples).

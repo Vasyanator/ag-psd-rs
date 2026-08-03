@@ -2,7 +2,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/ag-psd.svg)](https://crates.io/crates/ag-psd)
 [![docs.rs](https://img.shields.io/docsrs/ag-psd)](https://docs.rs/ag-psd)
-[![license](https://img.shields.io/crates/l/ag-psd.svg)](./LICENSE)
+[![license](https://img.shields.io/crates/l/ag-psd.svg)](https://github.com/Vasyanator/ag-psd-rs/blob/main/LICENSE)
 
 Read and write Adobe Photoshop (`.psd` / `.psb`) files in **pure Rust**, with no
 native Photoshop or system dependencies.
@@ -42,12 +42,19 @@ familiar if you've used the JavaScript version.
   - `.csh` — custom shapes (read/write)
   - `.ase` — Adobe Swatch Exchange palettes (read/write)
   - Engine Data parser/serializer (text engine)
+- **Photoshop 2026 compatible.** Photoshop 2026 writes descriptor enum values in
+  long form (`BlnM.normal`, `BlnM.colorBurn`) instead of the historical 4-character
+  codes (`BlnM.Nrml`, `BlnM.CBrn`). Both spellings are accepted.
+- **Bounded memory on read.** Reading enforces a byte budget for decoded bitmaps
+  and validates layer, mask and pattern rectangles, so a malformed or hostile
+  file fails with an error instead of exhausting memory — see
+  [Memory limits](#memory-limits).
 
 ## Installation
 
 ```toml
 [dependencies]
-ag-psd = "0.1"
+ag-psd = "0.2"
 ```
 
 Requires Rust **1.85+** (the crate uses the 2024 edition). The only runtime
@@ -81,7 +88,8 @@ fn main() -> std::io::Result<()> {
 ```
 
 For building documents from scratch, reading pixels, creating text layers, and a
-full tour of the options, see **[`docs/usage.md`](./docs/usage.md)**.
+full tour of the options, see the
+**[usage guide](https://github.com/Vasyanator/ag-psd-rs/blob/main/docs/usage.md)**.
 
 ## Public API at a glance
 
@@ -92,21 +100,70 @@ The crate root re-exports the main entry points:
 | `read_psd(&[u8], &ReadOptions) -> Result<Psd, ReadError>` | Parse a PSD/PSB from memory |
 | `write_psd(&Psd, &WriteOptions) -> Vec<u8>` | Serialize a PSD/PSB to bytes |
 | `write_psd_to_writer(&mut PsdWriter, &Psd, &WriteOptions)` | Serialize into an existing writer |
+| `get_layer_image_data(&Layer) -> Result<Option<PixelData>, ReadError>` | Decode one layer's bitmap on demand |
+| `get_layer_mask_image_data(&Layer) -> Result<Option<PixelData>, ReadError>` | Decode one layer's mask on demand |
+| `get_layer_real_mask_image_data(&Layer) -> Result<Option<PixelData>, ReadError>` | Decode one layer's vector-derived mask |
+| `get_composite_image_data(&Psd) -> Result<Option<PixelData>, ReadError>` | Decode the flattened composite on demand |
+| `decode_layer_pixels(&mut Layer, use_image_data: bool) -> Result<(), ReadError>` | Decode a layer's raw data in place and drop it |
 | `read_abr`, `read_csh` / `write_csh`, `read_ase` / `write_ase` | Companion Adobe formats |
 | `parse_engine_data`, `serialize_engine_data`, `decode_engine_data2` | Text Engine Data |
 
-The document model itself lives in the [`ag_psd::psd`] module: `Psd`, `Layer`,
-`LayerAdditionalInfo`, `PixelData`, `BlendMode`, `ColorMode`, `ReadOptions`,
-`WriteOptions`, and the many supporting types.
+The five decode-on-demand functions are the *lazy bitmap* API: with
+`ReadOptions::use_raw_data` the reader keeps undecoded channel bytes in
+`Layer::raw_data` / `Psd::raw_composite_data`, and you turn one bitmap at a time
+into pixels — so peak memory is one layer, not the whole document.
+
+`ReadError`, `ReadResult`, `PixelData` and `DEFAULT_TOTAL_MEMORY_LIMIT` are
+re-exported from the crate root too, so the types that appear in those
+signatures are nameable without a module path. The rest of the document model
+lives in the `ag_psd::psd` module: `Psd`, `Layer`, `LayerAdditionalInfo`,
+`BlendMode`, `ColorMode`, `ReadOptions`, `WriteOptions`, and the many supporting
+types.
+
+## Memory limits
+
+`ReadOptions` carries a **cumulative budget for decoded bitmaps**:
+
+```rust
+use ag_psd::psd::ReadOptions;
+
+// The default is 2 GiB (`ag_psd::DEFAULT_TOTAL_MEMORY_LIMIT`).
+let bounded = ReadOptions::default();
+
+// Opt out entirely — only for files you trust.
+let unlimited = ReadOptions { total_memory_limit: None, ..Default::default() };
+
+// Or pick your own ceiling.
+let tight = ReadOptions {
+    total_memory_limit: Some(256 * 1024 * 1024),
+    ..Default::default()
+};
+```
+
+Exceeding the budget aborts the read with `ReadError::ExceededMemoryLimit`, and
+an inverted or absurdly large layer, mask or pattern rectangle is rejected with
+`ReadError::InvalidBoxSize`. Note that `ReadOptions::default()` is therefore
+**not** an all-`None` value; if a genuinely large document used to read fine and
+now fails, set `total_memory_limit: None` or raise it.
+
+For untrusted, user-provided files, prefer the lazy-bitmap path: read the
+structure with `use_raw_data`, check the document and layer dimensions against
+your own limits, and only then decode layers one at a time. The
+[usage guide](https://github.com/Vasyanator/ag-psd-rs/blob/main/docs/usage.md#lazy-bitmaps-decoding-on-demand)
+has a worked example.
 
 ## Status & limitations
 
 The bulk of the upstream library is ported and exercised against the original
 test fixtures:
 
-- **Reads** essentially all of the upstream read fixtures.
-- **Round-trips** (read → write → read) the large majority of fixtures with a
-  structurally stable result.
+- **Reads** every upstream read fixture except the CMYK one, which is rejected
+  by design (upstream's own test suite skips it too).
+- **Matches** the `data.json` ground truth that ships with those fixtures,
+  except for the 16-bit and 32-bit documents whose layers live in an
+  `Lr16`/`Lr32` section this port does not yet parse.
+- **Round-trips** (read → write → read) with a structurally stable result
+  everywhere the 8-bit-RGB writer limitation below does not apply.
 
 The writer intentionally inherits the same constraints as upstream `ag-psd`:
 
@@ -132,12 +189,16 @@ filled in on demand.
 ## Testing
 
 ```sh
-cargo test -p ag-psd        # 150+ unit tests
+cargo test
 ```
 
-A fixture harness (`tests/fixtures.rs`) additionally reads and round-trips the
-upstream `ag-psd` `.psd` fixtures when they are available on disk; it reports
-coverage rather than asserting byte-exactness.
+Several hundred unit tests cover the primitives, the section decoders and the
+round-trip behavior of individual keys. A fixture harness (`tests/fixtures.rs`,
+not shipped in the published crate) additionally reads the upstream `ag-psd`
+`.psd` fixtures when they are available on disk, compares the result against the
+`data.json` ground truth that ships with them, and checks that read → write →
+read is structurally stable. Its known-failure sets are pinned, so a regression
+shows up as a new name rather than a slipped percentage.
 
 ## Credits & license
 
@@ -147,4 +208,5 @@ coverage rather than asserting byte-exactness.
 - Rust port: vibe-coded by Claude (Anthropic), maintained by Vasyanator.
 
 Licensed under the **MIT License**, the same as upstream. The original
-copyright © 2016 Agamnentzar is preserved; see [`LICENSE`](./LICENSE).
+copyright © 2016 Agamnentzar is preserved; see
+[`LICENSE`](https://github.com/Vasyanator/ag-psd-rs/blob/main/LICENSE).

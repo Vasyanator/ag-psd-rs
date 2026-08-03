@@ -356,29 +356,35 @@ mod tests {
 
     #[test]
     fn roundtrip_luni_name() {
-        let mut info = LayerAdditionalInfo::default();
-        info.name = Some("Привет Layer 1".to_string());
+        let info = LayerAdditionalInfo {
+            name: Some("Привет Layer 1".to_string()),
+            ..Default::default()
+        };
         let out = roundtrip(info);
         assert_eq!(out.name.as_deref(), Some("Привет Layer 1"));
     }
 
     #[test]
     fn roundtrip_lyid() {
-        let mut info = LayerAdditionalInfo::default();
-        info.id = Some(42.0);
+        let info = LayerAdditionalInfo {
+            id: Some(42.0),
+            ..Default::default()
+        };
         let out = roundtrip(info);
         assert_eq!(out.id, Some(42.0));
     }
 
     #[test]
     fn roundtrip_lspf_protected() {
-        let mut info = LayerAdditionalInfo::default();
-        info.protected_info = Some(ProtectedInfo {
-            transparency: Some(true),
-            composite: Some(false),
-            position: Some(true),
-            artboards: Some(true),
-        });
+        let info = LayerAdditionalInfo {
+            protected_info: Some(ProtectedInfo {
+                transparency: Some(true),
+                composite: Some(false),
+                position: Some(true),
+                artboards: Some(true),
+            }),
+            ..Default::default()
+        };
         let out = roundtrip(info);
         let p = out.protected_info.expect("protected");
         assert_eq!(p.transparency, Some(true));
@@ -390,12 +396,14 @@ mod tests {
 
     #[test]
     fn roundtrip_lsct_section_divider() {
-        let mut info = LayerAdditionalInfo::default();
-        info.section_divider = Some(SectionDivider {
-            divider_type: SectionDividerType::OpenFolder,
-            key: Some("pass".to_string()),
-            sub_type: Some(1.0),
-        });
+        let info = LayerAdditionalInfo {
+            section_divider: Some(SectionDivider {
+                divider_type: SectionDividerType::OpenFolder,
+                key: Some("pass".to_string()),
+                sub_type: Some(1.0),
+            }),
+            ..Default::default()
+        };
         let out = roundtrip(info);
         let d = out.section_divider.expect("section_divider");
         assert_eq!(d.divider_type, SectionDividerType::OpenFolder);
@@ -405,12 +413,14 @@ mod tests {
 
     #[test]
     fn roundtrip_lsct_type_only() {
-        let mut info = LayerAdditionalInfo::default();
-        info.section_divider = Some(SectionDivider {
-            divider_type: SectionDividerType::BoundingSectionDivider,
-            key: None,
-            sub_type: None,
-        });
+        let info = LayerAdditionalInfo {
+            section_divider: Some(SectionDivider {
+                divider_type: SectionDividerType::BoundingSectionDivider,
+                key: None,
+                sub_type: None,
+            }),
+            ..Default::default()
+        };
         let out = roundtrip(info);
         let d = out.section_divider.expect("section_divider");
         assert_eq!(d.divider_type, SectionDividerType::BoundingSectionDivider);
@@ -420,18 +430,22 @@ mod tests {
 
     #[test]
     fn roundtrip_lclr_color() {
-        let mut info = LayerAdditionalInfo::default();
-        info.layer_color = Some(LayerColor::Blue);
+        let info = LayerAdditionalInfo {
+            layer_color: Some(LayerColor::Blue),
+            ..Default::default()
+        };
         let out = roundtrip(info);
         assert_eq!(out.layer_color, Some(LayerColor::Blue));
     }
 
     #[test]
     fn roundtrip_bool_keys() {
-        let mut info = LayerAdditionalInfo::default();
-        info.blend_clippend_elements = Some(true);
-        info.knockout = Some(true);
-        info.transparency_shapes_layer = Some(false);
+        let info = LayerAdditionalInfo {
+            blend_clippend_elements: Some(true),
+            knockout: Some(true),
+            transparency_shapes_layer: Some(false),
+            ..Default::default()
+        };
         let out = roundtrip(info);
         assert_eq!(out.blend_clippend_elements, Some(true));
         assert_eq!(out.knockout, Some(true));
@@ -440,11 +454,13 @@ mod tests {
 
     #[test]
     fn roundtrip_iopa_brst_lyvr_fxrp() {
-        let mut info = LayerAdditionalInfo::default();
-        info.fill_opacity = Some(128.0 / 255.0);
-        info.channel_blending_restrictions = Some(vec![0.0, 1.0, 2.0]);
-        info.version = Some(70.0);
-        info.reference_point = Some(PointF { x: 1.5, y: -3.25 });
+        let info = LayerAdditionalInfo {
+            fill_opacity: Some(128.0 / 255.0),
+            channel_blending_restrictions: Some(vec![0.0, 1.0, 2.0]),
+            version: Some(70.0),
+            reference_point: Some(PointF { x: 1.5, y: -3.25 }),
+            ..Default::default()
+        };
         let out = roundtrip(info);
         // fill_opacity round-trips через u8.
         assert_eq!((out.fill_opacity.unwrap() * 255.0).round() as u8, 128);

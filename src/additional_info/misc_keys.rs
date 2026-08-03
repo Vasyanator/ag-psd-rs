@@ -9,12 +9,17 @@ extn, CAI , OCIO, GenI).
 PORT STATUS (см. PER-KEY ниже и REPORT в шапке коммита):
 - ПОЛНОСТЬЮ ПОРТИРОВАНЫ (read+has+write, точная байтовая раскладка):
     `sn2P`, `LMsk`, `FMsk`, `FEid` (+алиас `FXid`), `cinf`, `artb`.
+- ОБРАБАТЫВАЮТСЯ ВНЕ ЭТОГО МОДУЛЯ:
+    `Lr16`/`Lr32` — тело секции это ПОЛНАЯ вложенная layer-info секция
+              (слои 16/32-битного документа). Её читает
+              `crate::reader::read_additional_layer_info`, потому что нужен
+              весь `Psd`, а сюда приходит только `LayerAdditionalInfo`.
+              Здесь остаётся только явная ошибка для (не встречающегося на
+              практике) случая, когда такая секция вложена в СЛОЙ.
+              Write — no-op, как в upstream (предикат `() => false`).
 - SKIP/RAW-STUB (с причиной — см. соответствующую функцию):
     `shmd`  — пишущая сторона требует layerToId + serializeEffects/serializeTrackList
               (оркестрация документа и effects/timeline-сериализаторы не портированы);
-    `Lr16`/`Lr32` — рекурсивно читают/пишут ПОЛНУЮ вложенную layer-info секцию
-              (readLayerInfo/writeLayerInfo живут в ещё не портированной оркестрации
-              документа); сейчас read пропускает тело, write — no-op;
     `artd`  — документ-уровневое поле `Psd.artboards`, которого НЕТ в
               `LayerAdditionalInfo` (нельзя добавить без правки psd.rs);
     `Anno`  — документ-уровневое поле `Psd.annotations`, которого НЕТ в
@@ -59,6 +64,13 @@ use crate::writer::{
 // ===========================================================================
 
 /// См. GROUP-MODULE CONTRACT в mod.rs.
+///
+/// `Lr16`/`Lr32` are the exception in this group: their payload is a complete
+/// nested layer-info block, which needs the whole `Psd` and therefore lives in
+/// `crate::reader::read_additional_layer_info`, not here. The dispatcher routes
+/// the document-level occurrences (the only ones Photoshop writes) there before
+/// this function is reached; if one ever shows up on a *layer*, this returns an
+/// error instead of silently dropping the layers it contains.
 pub fn read(
     key: &str,
     reader: &mut PsdReader,
@@ -74,15 +86,10 @@ pub fn read(
         "cinf" => read_cinf(reader, info, left)?,
         "artb" => read_artb(reader, info, left)?,
 
+        "Lr16" | "Lr32" => return Err(nested_layer_info_unsupported(key)),
+
         // --- SKIP/RAW-STUB keys (consume the section body, NOTE the gap) ---
         //
-        // Lr16/Lr32: upstream calls `readLayerInfo(reader, psd, imageResources)`
-        // which recursively parses a FULL nested layer-info section. That needs
-        // the document orchestration (readLayerInfo) which is NOT ported yet.
-        // Until it is wired, just consume the section body. NOTE: nothing is
-        // stored — nested layers in 16/32-bit documents are dropped on read.
-        "Lr16" | "Lr32" => skip_bytes(reader, left(reader)),
-
         // shmd: read side could partially populate timestamp/animationFrames/
         // timeline/comps, but it depends on parseEffects/parseTrackList/frac and
         // a pile of descriptor structs that are not available here, and the
@@ -110,6 +117,20 @@ pub fn read(
         _ => return Ok(None),
     }
     Ok(Some(()))
+}
+
+/// Error reported for an `Lr16`/`Lr32` section that reached this group module.
+///
+/// Reaching it means the section was nested inside a *layer* rather than the
+/// document, where there is no `Psd` to attach the decoded layers to. Rather
+/// than consume the body and lose the layers without a word, the read fails;
+/// `crate::reader::read_additional_layer_info` swallows it (and skips the body)
+/// unless `ReadOptions::throw_for_missing_features` asks to be told.
+fn nested_layer_info_unsupported(key: &str) -> ReadError {
+    ReadError::StrictViolation(format!(
+        "Nested layer info section '{}' is only supported at document level",
+        key
+    ))
 }
 
 /// `LMsk` — user mask / layer mask as global.
@@ -254,7 +275,9 @@ fn read_feid(
 
 /// Извлекает значение enum `"type.value"` -> `"value"`.
 fn enum_value(s: &str) -> String {
-    s.splitn(2, '.').nth(1).unwrap_or("").to_string()
+    // Only the first dot separates the type from the value; the value itself
+    // may contain further dots, so `split_once` (not `split`) is required.
+    s.split_once('.').map_or("", |(_type, value)| value).to_string()
 }
 
 /// `cinf` — compositor info.
@@ -667,19 +690,23 @@ mod tests {
 
     #[test]
     fn roundtrip_sn2p() {
-        let mut info = LayerAdditionalInfo::default();
-        info.using_aligned_rendering = Some(true);
+        let info = LayerAdditionalInfo {
+            using_aligned_rendering: Some(true),
+            ..Default::default()
+        };
         let out = roundtrip(info);
         assert_eq!(out.using_aligned_rendering, Some(true));
     }
 
     #[test]
     fn roundtrip_lmsk() {
-        let mut info = LayerAdditionalInfo::default();
-        info.user_mask = Some(ColorSpaceMask {
-            color_space: Color::Rgb(Rgb { r: 255.0, g: 0.0, b: 128.0 }),
-            opacity: 0.5,
-        });
+        let info = LayerAdditionalInfo {
+            user_mask: Some(ColorSpaceMask {
+                color_space: Color::Rgb(Rgb { r: 255.0, g: 0.0, b: 128.0 }),
+                opacity: 0.5,
+            }),
+            ..Default::default()
+        };
         let out = roundtrip(info);
         let m = out.user_mask.expect("user_mask");
         match m.color_space {
@@ -694,11 +721,13 @@ mod tests {
 
     #[test]
     fn roundtrip_fmsk() {
-        let mut info = LayerAdditionalInfo::default();
-        info.filter_mask = Some(ColorSpaceMask {
-            color_space: Color::Grayscale(Grayscale { k: 100.0 }),
-            opacity: 1.0,
-        });
+        let info = LayerAdditionalInfo {
+            filter_mask: Some(ColorSpaceMask {
+                color_space: Color::Grayscale(Grayscale { k: 100.0 }),
+                opacity: 1.0,
+            }),
+            ..Default::default()
+        };
         let out = roundtrip(info);
         let m = out.filter_mask.expect("filter_mask");
         assert!(matches!(m.color_space, Color::Grayscale(_)));
@@ -707,17 +736,23 @@ mod tests {
 
     #[test]
     fn roundtrip_cinf() {
-        let mut info = LayerAdditionalInfo::default();
-        info.compositor_used = Some(CompositorUsed {
-            version: Some(VersionTriple { major: 1.0, minor: 2.0, fix: 3.0 }),
-            photoshop_version: Some(VersionTriple { major: 24.0, minor: 0.0, fix: 0.0 }),
-            description: "desc".to_string(),
-            reason: "reason text".to_string(),
-            engine: "compCore".to_string(),
-            enable_comp_core: Some("feature".to_string()),
-            comp_core_support: Some("supported".to_string()),
+        let info = LayerAdditionalInfo {
+            compositor_used: Some(CompositorUsed {
+                version: Some(VersionTriple { major: 1.0, minor: 2.0, fix: 3.0 }),
+                photoshop_version: Some(VersionTriple {
+                    major: 24.0,
+                    minor: 0.0,
+                    fix: 0.0,
+                }),
+                description: "desc".to_string(),
+                reason: "reason text".to_string(),
+                engine: "compCore".to_string(),
+                enable_comp_core: Some("feature".to_string()),
+                comp_core_support: Some("supported".to_string()),
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
         let out = roundtrip(info);
         let c = out.compositor_used.expect("compositor_used");
         assert_eq!(c.description, "desc");
@@ -733,28 +768,30 @@ mod tests {
 
     #[test]
     fn roundtrip_feid() {
-        let mut info = LayerAdditionalInfo::default();
-        info.filter_effects_masks = Some(vec![FilterEffectsMask {
-            id: "my-id".to_string(),
-            top: 1.0,
-            left: 2.0,
-            bottom: 30.0,
-            right: 40.0,
-            depth: 8.0,
-            channels: vec![
-                Some(FilterEffectsChannel { compression_mode: 0.0, data: vec![1, 2, 3] }),
-                None,
-                Some(FilterEffectsChannel { compression_mode: 1.0, data: vec![9, 8] }),
-            ],
-            extra: Some(FilterEffectsExtra {
-                top: 5.0,
-                left: 6.0,
-                bottom: 7.0,
-                right: 8.0,
-                compression_mode: 0.0,
-                data: vec![4, 5, 6, 7],
-            }),
-        }]);
+        let info = LayerAdditionalInfo {
+            filter_effects_masks: Some(vec![FilterEffectsMask {
+                id: "my-id".to_string(),
+                top: 1.0,
+                left: 2.0,
+                bottom: 30.0,
+                right: 40.0,
+                depth: 8.0,
+                channels: vec![
+                    Some(FilterEffectsChannel { compression_mode: 0.0, data: vec![1, 2, 3] }),
+                    None,
+                    Some(FilterEffectsChannel { compression_mode: 1.0, data: vec![9, 8] }),
+                ],
+                extra: Some(FilterEffectsExtra {
+                    top: 5.0,
+                    left: 6.0,
+                    bottom: 7.0,
+                    right: 8.0,
+                    compression_mode: 0.0,
+                    data: vec![4, 5, 6, 7],
+                }),
+            }]),
+            ..Default::default()
+        };
         let out = roundtrip(info);
         let masks = out.filter_effects_masks.expect("filter_effects_masks");
         assert_eq!(masks.len(), 1);
@@ -770,16 +807,44 @@ mod tests {
         assert_eq!((extra.top, extra.left, extra.bottom, extra.right), (5.0, 6.0, 7.0, 8.0));
     }
 
+    /// A layer-nested `Lr16`/`Lr32` has no document to attach its layers to, so
+    /// the group module must report it instead of consuming the body silently
+    /// (the document-level occurrences never reach here — `crate::reader`
+    /// answers those by recursing into the layer-info reader).
+    #[test]
+    fn nested_layer_info_at_layer_level_is_reported() {
+        let opts = ReadOptions::default();
+        for key in ["Lr16", "Lr32"] {
+            let body = [0u8; 8];
+            let mut reader = PsdReader::new(&body, None, None);
+            let mut info = LayerAdditionalInfo::default();
+            let mut ctx = ReadCtx { options: &opts, large: false };
+            let len = body.len();
+            let left = move |r: &PsdReader| len.saturating_sub(r.offset);
+            let err = read(key, &mut reader, &mut info, &left, &mut ctx)
+                .expect_err("layer-level nested layer info must not be dropped silently");
+            match err {
+                ReadError::StrictViolation(msg) => assert!(
+                    msg.contains(key) && msg.contains("document level"),
+                    "unexpected message: {msg}"
+                ),
+                other => panic!("unexpected error: {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn roundtrip_artb() {
-        let mut info = LayerAdditionalInfo::default();
-        info.artboard = Some(LayerArtboard {
-            rect: Bounds { top: 0.0, left: 0.0, bottom: 1000.0, right: 800.0 },
-            guide_indices: Some(vec![1.0, 2.0]),
-            preset_name: Some("iPhone".to_string()),
-            color: Some(Color::Rgb(Rgb { r: 255.0, g: 255.0, b: 255.0 })),
-            background_type: Some(1.0),
-        });
+        let info = LayerAdditionalInfo {
+            artboard: Some(LayerArtboard {
+                rect: Bounds { top: 0.0, left: 0.0, bottom: 1000.0, right: 800.0 },
+                guide_indices: Some(vec![1.0, 2.0]),
+                preset_name: Some("iPhone".to_string()),
+                color: Some(Color::Rgb(Rgb { r: 255.0, g: 255.0, b: 255.0 })),
+                background_type: Some(1.0),
+            }),
+            ..Default::default()
+        };
         let out = roundtrip(info);
         let a = out.artboard.expect("artboard");
         assert_eq!((a.rect.bottom, a.rect.right), (1000.0, 800.0));

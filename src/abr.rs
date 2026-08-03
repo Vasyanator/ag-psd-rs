@@ -9,7 +9,11 @@ Source compatibility:
   поэтому здесь портирован только `read_abr`.
 
 Dependency gaps (портированы локально здесь, должны переехать в свои модули):
-- `read_pattern` / `read_data_rle` (8-бит) — из `psdReader.ts`, ещё не в `reader.rs`.
+- `read_data_rle` (8-бит, uint16-длины) — из `psdReader.ts`; локальная копия нужна
+  потому, что ABR-`samp` пишет в заимствованный `&mut [u8]`, а `reader::read_data_rle`
+  работает с владеющим `DecodeTarget`. `read_pattern` — НЕ копия: ABR-секция `patt`
+  вызывает единственную реализацию `crate::reader::read_pattern` (ридер, созданный
+  `PsdReader::new`, не несёт бюджета памяти — как upstream `createReader`).
 - descriptor-хелперы `parsePercent` / `parseAngle` / `parseUnitsToNumber` и enum
   `BlnM` (descriptor.ts) — здесь как `parse_percent` / `parse_angle` /
   `parse_units_to_number` / `blnm_decode`.
@@ -21,11 +25,12 @@ Main responsibilities:
 - разбор ABR версий 6/7/9/10 (minor 1/2): секции '8BIM' samp/desc/patt/phry.
 */
 
+use crate::additional_info::effects_keys::bln_m_decode;
 use crate::descriptor::{Descriptor, DescriptorValue, UnitDoubleValue};
-use crate::psd::{BlendMode, ColorMode, PatternBounds, PatternInfo};
+use crate::psd::{BlendMode, PatternInfo};
 use crate::reader::{
-    check_signature, read_bytes, read_int16, read_int32, read_pascal_string, read_signature,
-    read_uint16, read_uint32, read_uint8, read_unicode_string, skip_bytes, PsdReader, ReadError,
+    check_signature, read_bytes, read_int16, read_int32, read_pascal_string, read_pattern,
+    read_signature, read_uint16, read_uint32, read_uint8, skip_bytes, PsdReader, ReadError,
     ReadResult,
 };
 
@@ -355,7 +360,7 @@ fn as_descriptor(v: Option<&DescriptorValue>) -> Option<&Descriptor> {
     }
 }
 
-fn as_units<'a>(v: Option<&'a DescriptorValue>) -> Option<&'a UnitDoubleValue> {
+fn as_units(v: Option<&DescriptorValue>) -> Option<&UnitDoubleValue> {
     match v {
         Some(DescriptorValue::UnitDouble(u)) => Some(u),
         _ => None,
@@ -453,9 +458,15 @@ fn blnm_decode(code: &str) -> BlendMode {
         "Strt" => BlendMode::Saturation,
         "Clr " => BlendMode::Color,
         "Lmns" => BlendMode::Luminosity,
-        // 'linearHeight'/'Hght'/'Sbtr' используются в ABR, но не имеют отдельного
-        // BlendMode-варианта в crate::psd — отображаем на дефолт 'normal'.
-        _ => BlendMode::Normal,
+        // ABR-only codes; they gained `BlendMode` variants in upstream v31.
+        "linearHeight" => BlendMode::LinearHeight,
+        "Hght" => BlendMode::Height,
+        "Sbtr" => BlendMode::Subtraction,
+        // Photoshop 2026 writes the long-form id (`BlnM.normal`, `BlnM.colorBurn`)
+        // instead of the historical code. Delegate to the shared `BlnM` codec, which
+        // implements upstream's key/camelCase fallback chain, rather than repeating the
+        // whole name table here.
+        other => bln_m_decode(&format!("BlnM.{other}")),
     }
 }
 
@@ -525,15 +536,12 @@ fn parse_brush_shape(desc: &Descriptor) -> ReadResult<BrushShape> {
         "dTips" => {
             let grid_size = as_number(dget(desc, "dtipsGridSize"));
             let height_map = as_raw(dget(desc, "dtipsErodibleTipHeightMap"));
-            let (tips_grid_size, tips_erodible_tip_height_map) =
-                if grid_size != 0.0 && height_map.is_some() {
-                    (
-                        Some(grid_size),
-                        Some(parse_heightmap(height_map.unwrap())),
-                    )
-                } else {
-                    (None, None)
-                };
+            // Both fields are emitted only when the grid size is non-zero AND the
+            // height map is present, mirroring upstream's combined condition.
+            let (tips_grid_size, tips_erodible_tip_height_map) = match height_map {
+                Some(map) if grid_size != 0.0 => (Some(grid_size), Some(parse_heightmap(map))),
+                _ => (None, None),
+            };
             Ok(BrushShape::Tips {
                 angle: parse_angle(dget(desc, "Angl"))?,
                 size: parse_units_to_number(dget(desc, "Dmtr"), "Pixels")?,
@@ -622,8 +630,7 @@ fn read_data_rle(
     let mut data: Option<&mut [u8]> = pixel_data.map(|p| &mut *p.data);
 
     li = 0;
-    for c in 0..offsets.len() {
-        let offset = offsets[c];
+    for (c, &offset) in offsets.iter().enumerate() {
         let extra = c > extra_limit || offset > extra_limit;
 
         if !has_data || extra {
@@ -671,217 +678,6 @@ fn read_data_rle(
         }
     }
     Ok(())
-}
-
-fn setup_grayscale(data: &mut [u8], width: usize, height: usize) {
-    let size = width * height * 4;
-    let mut i = 0;
-    while i < size {
-        let c = data[i];
-        data[i + 1] = c;
-        data[i + 2] = c;
-        i += 4;
-    }
-}
-
-fn copy_channel_to_rgba(
-    src: &[u8],
-    src_w: usize,
-    src_h: usize,
-    dst: &mut [u8],
-    dst_w: usize,
-    ox: usize,
-    oy: usize,
-    offset: usize,
-) {
-    for y in 0..src_h {
-        for x in 0..src_w {
-            let s = x + y * src_w;
-            let d = (ox + x + (y + oy) * dst_w) * 4;
-            dst[d + offset] = src[s];
-        }
-    }
-}
-
-/// Зеркало `readPattern(reader)` (RGB / Grayscale; Indexed читает палитру, но не
-/// поддерживает данные).
-fn read_pattern(reader: &mut PsdReader) -> ReadResult<PatternInfo> {
-    let mut length = read_uint32(reader)? as usize;
-    while length % 4 != 0 {
-        length += 1;
-    }
-    let end = reader.offset + length;
-    let version = read_uint32(reader)?;
-    if version != 1 {
-        return Err(ReadError::StrictViolation(format!(
-            "Invalid pattern version: {}",
-            version
-        )));
-    }
-
-    let color_mode = read_uint32(reader)? as i32;
-    let x = read_int16(reader)?;
-    let y = read_int16(reader)?;
-
-    let rgb = ColorMode::Rgb as i32;
-    let grayscale = ColorMode::Grayscale as i32;
-    let indexed = ColorMode::Indexed as i32;
-    if color_mode != rgb && color_mode != grayscale && color_mode != indexed {
-        return Err(ReadError::StrictViolation(format!(
-            "Unsupported pattern color mode: {}",
-            color_mode
-        )));
-    }
-
-    let name = read_unicode_string(reader)?;
-    let id = read_pascal_string(reader, 1)?;
-
-    if color_mode == indexed {
-        for _ in 0..256 {
-            read_uint8(reader)?;
-            read_uint8(reader)?;
-            read_uint8(reader)?;
-        }
-        skip_bytes(reader, 4);
-    }
-
-    // virtual memory array list
-    let version2 = read_uint32(reader)?;
-    if version2 != 3 {
-        return Err(ReadError::StrictViolation(format!(
-            "Invalid pattern VMAL version: {}",
-            version2
-        )));
-    }
-
-    read_uint32(reader)?; // length
-    let top = read_uint32(reader)?;
-    let left = read_uint32(reader)?;
-    let bottom = read_uint32(reader)?;
-    let right = read_uint32(reader)?;
-    let channels_count = read_uint32(reader)?;
-    let width = (right - left) as usize;
-    let height = (bottom - top) as usize;
-    let mut data = vec![0u8; width * height * 4];
-
-    let mut i = 3;
-    while i < data.len() {
-        data[i] = 255;
-        i += 4;
-    }
-
-    let mut ch = 0usize;
-    for _ in 0..(channels_count + 2) {
-        let has = read_uint32(reader)?;
-        if has == 0 {
-            continue;
-        }
-
-        let clen = read_uint32(reader)? as usize;
-        let pixel_depth = read_uint32(reader)?;
-        let ctop = read_uint32(reader)?;
-        let cleft = read_uint32(reader)?;
-        let cbottom = read_uint32(reader)?;
-        let cright = read_uint32(reader)?;
-        let pixel_depth2 = read_uint16(reader)?;
-        let compression_mode = read_uint8(reader)?; // 0 - raw, 1 - rle
-        let data_length = clen - (4 + 16 + 2 + 1);
-        let cdata = read_bytes(reader, data_length)?;
-
-        if pixel_depth != 8 || pixel_depth2 != 8 {
-            return Err(ReadError::StrictViolation(
-                "16bit pixel depth not supported for patterns".to_string(),
-            ));
-        }
-
-        let w = (cright - cleft) as usize;
-        let h = (cbottom - ctop) as usize;
-        let ox = (cleft - left) as usize;
-        let oy = (ctop - top) as usize;
-
-        if compression_mode == 0 {
-            if color_mode == rgb && ch < 3 {
-                for yy in 0..h {
-                    for xx in 0..w {
-                        let src = xx + yy * w;
-                        let dst = (ox + xx + (yy + oy) * width) * 4;
-                        data[dst + ch] = cdata[src];
-                    }
-                }
-            }
-            if color_mode == grayscale && ch < 1 {
-                for yy in 0..h {
-                    for xx in 0..w {
-                        let src = xx + yy * w;
-                        let dst = (ox + xx + (yy + oy) * width) * 4;
-                        let value = cdata[src];
-                        data[dst] = value;
-                        data[dst + 1] = value;
-                        data[dst + 2] = value;
-                    }
-                }
-            }
-            if color_mode == indexed {
-                return Err(ReadError::StrictViolation(
-                    "Indexed pattern color mode not implemented".to_string(),
-                ));
-            }
-        } else if compression_mode == 1 {
-            let mut temp = vec![0u8; w * h];
-            let mut cdata_reader = PsdReader::new(&cdata, None, None);
-
-            if color_mode == rgb && ch < 3 {
-                {
-                    let mut pd = PixelData {
-                        data: &mut temp,
-                        width: w,
-                        height: h,
-                    };
-                    read_data_rle(&mut cdata_reader, Some(&mut pd), w, h, 8, 1, &[0])?;
-                }
-                copy_channel_to_rgba(&temp, w, h, &mut data, width, ox, oy, ch);
-            }
-            if color_mode == grayscale && ch < 1 {
-                {
-                    let mut pd = PixelData {
-                        data: &mut temp,
-                        width: w,
-                        height: h,
-                    };
-                    read_data_rle(&mut cdata_reader, Some(&mut pd), w, h, 8, 1, &[0])?;
-                }
-                copy_channel_to_rgba(&temp, w, h, &mut data, width, ox, oy, 0);
-                setup_grayscale(&mut data, width, height);
-            }
-            if color_mode == indexed {
-                return Err(ReadError::StrictViolation(
-                    "Indexed pattern color mode not implemented".to_string(),
-                ));
-            }
-        } else {
-            return Err(ReadError::StrictViolation(
-                "Invalid pattern compression mode".to_string(),
-            ));
-        }
-
-        ch += 1;
-    }
-
-    reader.offset = end;
-
-    Ok(PatternInfo {
-        id,
-        name,
-        x: x as f64,
-        y: y as f64,
-        bounds: PatternBounds {
-            x: left as f64,
-            y: top as f64,
-            w: width as f64,
-            h: height as f64,
-        },
-        data,
-    })
 }
 
 // ===========================================================================
@@ -1191,8 +987,8 @@ pub fn read_abr(buffer: &[u8], _options: &ReadAbrOptions) -> ReadResult<Abr> {
                             }
                         } else if bit_depth == 16 {
                             if compression == 0 {
-                                for i in 0..alpha.len() {
-                                    alpha[i] = (read_uint16(reader)? >> 8) as u8; // -> 8bit
+                                for sample in &mut alpha {
+                                    *sample = (read_uint16(reader)? >> 8) as u8; // -> 8bit
                                 }
                             } else if compression == 1 {
                                 return Err(ReadError::StrictViolation(
@@ -1266,6 +1062,7 @@ pub fn read_abr(buffer: &[u8], _options: &ReadAbrOptions) -> ReadResult<Abr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::psd::ColorMode;
     use std::path::PathBuf;
 
     fn fixture_dir() -> PathBuf {
@@ -1378,5 +1175,105 @@ mod tests {
             }
             other => panic!("expected computed brush, got {:?}", other),
         }
+    }
+
+    /// Builds an indexed-mode pattern record whose single channel is stored
+    /// uncompressed (`compressionMode == 0`).
+    ///
+    /// Kept here because this is the ABR-side regression test for the shared
+    /// `crate::reader::read_pattern`: it proves the ABR `patt` section still
+    /// decodes indexed patterns through the consolidated implementation.
+    fn indexed_raw_pattern_bytes(palette: &[[u8; 3]; 256], indices: &[u8], w: u32, h: u32) -> Vec<u8> {
+        use crate::writer::{
+            create_writer_default, get_writer_buffer, write_bytes, write_int16, write_pascal_string,
+            write_uint16, write_uint32, write_uint8, write_unicode_string,
+        };
+
+        let mut body = create_writer_default();
+        write_uint32(&mut body, 1); // version
+        write_uint32(&mut body, ColorMode::Indexed as u32);
+        write_int16(&mut body, 0); // x
+        write_int16(&mut body, 0); // y
+        write_unicode_string(&mut body, "pat\0");
+        write_pascal_string(&mut body, "deadbeef-0000-0000-0000-000000000000", 1);
+        for entry in palette.iter() {
+            write_uint8(&mut body, entry[0]);
+            write_uint8(&mut body, entry[1]);
+            write_uint8(&mut body, entry[2]);
+        }
+        write_uint32(&mut body, 0); // 4 bytes the reader skips
+
+        write_uint32(&mut body, 3); // virtual memory array list version
+        write_uint32(&mut body, 0); // list length, unused by the reader
+        write_uint32(&mut body, 0); // top
+        write_uint32(&mut body, 0); // left
+        write_uint32(&mut body, h); // bottom
+        write_uint32(&mut body, w); // right
+        write_uint32(&mut body, 1); // channels count
+
+        write_uint32(&mut body, 1); // has
+        write_uint32(&mut body, (indices.len() + 4 + 16 + 2 + 1) as u32);
+        write_uint32(&mut body, 8); // pixelDepth
+        write_uint32(&mut body, 0); // ctop
+        write_uint32(&mut body, 0); // cleft
+        write_uint32(&mut body, h); // cbottom
+        write_uint32(&mut body, w); // cright
+        write_uint16(&mut body, 8); // pixelDepth2
+        write_uint8(&mut body, 0); // compressionMode: raw
+        write_bytes(&mut body, Some(indices));
+        write_uint32(&mut body, 0); // absent slot
+        write_uint32(&mut body, 0); // absent slot
+
+        let mut payload = get_writer_buffer(&body);
+        // The reader rounds the record length up to a multiple of 4 before
+        // computing the record end, so keep the payload aligned.
+        while payload.len() % 4 != 0 {
+            payload.push(0);
+        }
+
+        let mut out = create_writer_default();
+        write_uint32(&mut out, payload.len() as u32);
+        write_bytes(&mut out, Some(&payload));
+        get_writer_buffer(&out)
+    }
+
+    #[test]
+    fn read_pattern_decodes_indexed_raw_data() {
+        let mut palette = [[0u8; 3]; 256];
+        palette[1] = [10, 20, 30];
+        palette[2] = [40, 50, 60];
+        palette[3] = [70, 80, 90];
+        palette[4] = [100, 110, 120];
+        let indices: [u8; 4] = [1, 2, 3, 4];
+        let bytes = indexed_raw_pattern_bytes(&palette, &indices, 2, 2);
+
+        let mut reader = PsdReader::new(&bytes, None, None);
+        let out = read_pattern(&mut reader).expect("indexed pattern must decode");
+
+        assert_eq!(out.bounds.w, 2.0);
+        assert_eq!(out.bounds.h, 2.0);
+        for (px, index) in indices.iter().enumerate() {
+            let color = palette[*index as usize];
+            assert_eq!(&out.data[px * 4..px * 4 + 3], &color[..], "pixel {px}");
+            assert_eq!(out.data[px * 4 + 3], 255, "pixel {px} alpha");
+        }
+    }
+
+    #[test]
+    fn blnm_decode_handles_codes_long_form_and_abr_only_modes() {
+        // Historical 4-char codes.
+        assert_eq!(blnm_decode("BlnM.Nrml"), BlendMode::Normal);
+        assert_eq!(blnm_decode("BlnM.CBrn"), BlendMode::ColorBurn);
+        // ABR-only codes; before v31 these silently became `normal`.
+        assert_eq!(blnm_decode("BlnM.linearHeight"), BlendMode::LinearHeight);
+        assert_eq!(blnm_decode("BlnM.Hght"), BlendMode::Height);
+        assert_eq!(blnm_decode("BlnM.Sbtr"), BlendMode::Subtraction);
+        // Photoshop 2026 long form, delegated to the shared BlnM codec.
+        assert_eq!(blnm_decode("BlnM.colorBurn"), BlendMode::ColorBurn);
+        assert_eq!(blnm_decode("BlnM.linearHeight"), BlendMode::LinearHeight);
+        // Bare code without the `BlnM.` prefix (some ABR payloads).
+        assert_eq!(blnm_decode("Mltp"), BlendMode::Multiply);
+        // Unknown -> default.
+        assert_eq!(blnm_decode("BlnM.wibble"), BlendMode::Normal);
     }
 }

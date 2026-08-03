@@ -476,6 +476,13 @@ fn decode_scan(
                                 *sa_state = 0;
                             }
                         }
+                        // Deliberately a nested `if` rather than a match guard: states
+                        // 1|2, 3 and 4 all open with the same `if zz[z] != 0` test, and
+                        // that symmetry mirrors upstream's `switch (successiveACState)`
+                        // in jpeg.ts. Collapsing only this arm into `4 if zz[z] != 0`
+                        // would hide the shared shape (semantics are identical because
+                        // the trailing `_ => {}` arm is a no-op).
+                        #[allow(clippy::collapsible_match)]
                         4 => {
                             if zz[z] != 0 {
                                 let bit = reader.read_bit()?.unwrap_or(0) as i32;
@@ -1006,7 +1013,8 @@ fn parse(data: &[u8]) -> JpegResult<Decoded> {
                     quantization_tables[spec & 15] = Some(table);
                 }
             }
-            0xFFC0 | 0xFFC1 | 0xFFC2 => {
+            // SOF0 (0xFFC0), SOF1 (0xFFC1), SOF2 (0xFFC2) — contiguous marker range.
+            0xFFC0..=0xFFC2 => {
                 // SOF
                 p.read_uint16(); // length
                 let progressive = file_marker == 0xFFC2;
@@ -1206,14 +1214,12 @@ fn parse(data: &[u8]) -> JpegResult<Decoded> {
 // getData — produce interleaved component samples (port of getData)
 // ===========================================================================
 
+/// Clamps a sample to the 0..=255 range, mirroring upstream `clampTo8bit`.
+///
+/// `f64::clamp` matches the upstream ternary exactly, NaN included (NaN is
+/// neither `< 0.0` nor `> 255.0`, so it passes through unchanged).
 fn clamp_to_8bit(a: f64) -> f64 {
-    if a < 0.0 {
-        0.0
-    } else if a > 255.0 {
-        255.0
-    } else {
-        a
-    }
+    a.clamp(0.0, 255.0)
 }
 
 fn get_data(decoded: &Decoded) -> Vec<u8> {
@@ -1341,6 +1347,13 @@ fn get_data(decoded: &Decoded) -> Vec<u8> {
 ///
 /// Port of TS `decodeJpeg(encoded, createImageData)`: the TS callback created an
 /// `ImageData`; here we directly allocate the RGBA8 buffer in `PixelData`.
+///
+/// Supported component counts are 1 (grayscale), 2 (grayscale + alpha),
+/// 3 (YCbCr) and 4 (CMYK/YCCK).
+///
+/// # Errors
+/// Returns an error string for an empty buffer, a malformed stream, or a
+/// component count outside the supported set.
 pub fn decode_jpeg(encoded: &[u8]) -> JpegResult<PixelData> {
     if encoded.is_empty() {
         return Err("Empty jpeg buffer".to_string());
@@ -1365,6 +1378,20 @@ pub fn decode_jpeg(encoded: &[u8]) -> JpegResult<PixelData> {
                 out[j + 1] = yv;
                 out[j + 2] = yv;
                 out[j + 3] = 255;
+                j += 4;
+            }
+        }
+        2 => {
+            // Grayscale + alpha: the luminance sample is replicated across RGB
+            // and the second component becomes the alpha channel.
+            for _ in 0..(width * height) {
+                let yv = data[i];
+                let a = data[i + 1];
+                i += 2;
+                out[j] = yv;
+                out[j + 1] = yv;
+                out[j + 2] = yv;
+                out[j + 3] = a;
                 j += 4;
             }
         }
@@ -1474,6 +1501,70 @@ mod tests {
             assert_eq!(px[0], px[1]);
             assert_eq!(px[1], px[2]);
             assert_eq!(px[3], 255);
+        }
+    }
+
+    /// Same minimal baseline stream as `tiny_gray_jpeg`, but with two
+    /// components (luminance + alpha), both 1x1 sampled and sharing the single
+    /// quantization/Huffman tables.
+    fn tiny_gray_alpha_jpeg() -> Vec<u8> {
+        // SOI
+        let mut v: Vec<u8> = vec![0xFF, 0xD8];
+        // DQT (id 0, all 1s)
+        v.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x43, 0x00]);
+        v.extend(std::iter::repeat_n(0x01u8, 64));
+        // SOF0: length 14 = 8 + 3*2 components
+        v.extend_from_slice(&[
+            0xFF, 0xC0, 0x00, 0x0E, 0x08, 0x00, 0x08, 0x00, 0x08, 0x02, 0x01, 0x11, 0x00, 0x02,
+            0x11, 0x00,
+        ]);
+        // DHT DC table 0: one code of length 2 -> value 0
+        let mut dht_dc: Vec<u8> = vec![0x00];
+        let mut counts = [0u8; 16];
+        counts[1] = 1;
+        dht_dc.extend_from_slice(&counts);
+        dht_dc.push(0x00);
+        let dht_dc_len = (dht_dc.len() + 2) as u16;
+        v.extend_from_slice(&[0xFF, 0xC4]);
+        v.extend_from_slice(&dht_dc_len.to_be_bytes());
+        v.extend_from_slice(&dht_dc);
+        // DHT AC table 0: one code of length 2 -> value 0 (EOB)
+        let mut dht_ac: Vec<u8> = vec![0x10];
+        let mut counts_ac = [0u8; 16];
+        counts_ac[1] = 1;
+        dht_ac.extend_from_slice(&counts_ac);
+        dht_ac.push(0x00);
+        let dht_ac_len = (dht_ac.len() + 2) as u16;
+        v.extend_from_slice(&[0xFF, 0xC4]);
+        v.extend_from_slice(&dht_ac_len.to_be_bytes());
+        v.extend_from_slice(&dht_ac);
+        // SOS: length 10 = 6 + 2*2, both components use tables 0/0
+        v.extend_from_slice(&[
+            0xFF, 0xDA, 0x00, 0x0A, 0x02, 0x01, 0x00, 0x02, 0x00, 0x00, 0x3F, 0x00,
+        ]);
+        // One MCU: DC("00") AC("00") for each component -> 8 zero bits.
+        v.push(0x00);
+        // EOI
+        v.extend_from_slice(&[0xFF, 0xD9]);
+        v
+    }
+
+    /// Two-component streams must expand to RGBA with the luminance replicated
+    /// across RGB and the second component used as alpha, instead of being
+    /// rejected as an unsupported colour mode.
+    #[test]
+    fn decodes_two_component_jpeg_as_gray_plus_alpha() {
+        let jpeg = tiny_gray_alpha_jpeg();
+        let result = decode_jpeg(&jpeg).expect("should decode");
+        assert_eq!(result.width, 8);
+        assert_eq!(result.height, 8);
+        assert_eq!(result.data.len(), 8 * 8 * 4);
+        for px in result.data.chunks_exact(4) {
+            assert_eq!(px[0], px[1]);
+            assert_eq!(px[1], px[2]);
+            // Both components decode to the same flat value here, so alpha must
+            // equal the luminance rather than the hardcoded 255.
+            assert_eq!(px[3], px[0]);
         }
     }
 

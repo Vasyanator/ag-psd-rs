@@ -284,9 +284,11 @@ pub fn parse_engine_data(data: &[u8]) -> Result<EngineValue, EngineDataError> {
                 index += 1;
             }
 
+            // Bytes are mapped 1:1 to code points (Latin-1), mirroring upstream's
+            // `String.fromCharCode(data[j])`; not a UTF-8 decode.
             let mut name = String::new();
-            for j in start..index {
-                name.push(data[j] as char);
+            for &byte in &data[start..index] {
+                name.push(char::from(byte));
             }
 
             push_property(&mut stack, &mut root, &name)?;
@@ -513,21 +515,19 @@ fn js_number_to_string(value: f64) -> String {
     }
 }
 
-// getKeys: воспроизводит порядок ключей upstream'а, включая баг с двойным переносом '99'.
+/// Reproduces upstream `getKeys`: the serialisation order of a dictionary.
+///
+/// Photoshop expects the reserved keys `'99'` and `'98'` first, in that order.
+/// They are hoisted in two steps — `'98'` to the front, then `'99'` in front of
+/// it — so that `'99'` ends up first whenever both are present. Every other key
+/// keeps its insertion order.
 fn get_keys(map: &[(String, EngineValue)]) -> Vec<String> {
     let mut keys: Vec<String> = map.iter().map(|(k, _)| k.clone()).collect();
 
-    // if (keys.indexOf('98') !== -1) keys.unshift(...keys.splice(keys.indexOf('99'), 1));
-    if keys.iter().any(|k| k == "98") {
-        if let Some(pos) = keys.iter().position(|k| k == "99") {
-            let removed = keys.remove(pos);
-            keys.insert(0, removed);
-        }
-        // Если '99' нет — splice(-1, 1) удалил бы последний элемент и перенёс его в начало.
-        else if !keys.is_empty() {
-            let removed = keys.remove(keys.len() - 1);
-            keys.insert(0, removed);
-        }
+    // if (keys.indexOf('98') !== -1) keys.unshift(...keys.splice(keys.indexOf('98'), 1));
+    if let Some(pos) = keys.iter().position(|k| k == "98") {
+        let removed = keys.remove(pos);
+        keys.insert(0, removed);
     }
 
     // if (keys.indexOf('99') !== -1) keys.unshift(...keys.splice(keys.indexOf('99'), 1));
@@ -885,5 +885,29 @@ mod tests {
             ("1".to_string(), EngineValue::Number(2.0)),
         ];
         assert_eq!(get_keys(&map), vec!["99", "0", "1"]);
+    }
+
+    /// `'98'` must be hoisted on its own, not only as a side effect of `'99'`
+    /// being present.
+    #[test]
+    fn get_keys_98_first() {
+        let map = vec![
+            ("0".to_string(), EngineValue::Number(1.0)),
+            ("98".to_string(), EngineValue::Str("/Type".to_string())),
+            ("1".to_string(), EngineValue::Number(2.0)),
+        ];
+        assert_eq!(get_keys(&map), vec!["98", "0", "1"]);
+    }
+
+    /// With both reserved keys present, `'99'` comes first and `'98'` second.
+    #[test]
+    fn get_keys_99_then_98_first() {
+        let map = vec![
+            ("0".to_string(), EngineValue::Number(1.0)),
+            ("98".to_string(), EngineValue::Str("/A".to_string())),
+            ("1".to_string(), EngineValue::Number(2.0)),
+            ("99".to_string(), EngineValue::Str("/B".to_string())),
+        ];
+        assert_eq!(get_keys(&map), vec!["99", "98", "0", "1"]);
     }
 }

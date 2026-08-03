@@ -95,12 +95,19 @@ const MEASUREMENT_UNITS: [Option<DimensionUnit>; 6] = [
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
-/// Mirror `charToNibble`.
+/// Mirror `charToNibble`: ASCII hex digit -> its 0-15 value.
+///
+/// Accepts `'0'`-`'9'`, `'a'`-`'f'` and `'A'`-`'F'`. Any other byte is outside the
+/// contract of the callers (they only ever pass bytes from a hex string produced by
+/// [`HEX`] or read back from one) and yields a meaningless nibble.
 fn char_to_nibble(code: u8) -> u8 {
-    if code <= 57 {
-        code - 48
-    } else {
+    if code <= b'9' {
+        code - b'0'
+    } else if code >= b'a' {
         code - 87
+    } else {
+        // 'A'-'F': 0x41 - 55 == 10.
+        code - 55
     }
 }
 
@@ -113,7 +120,7 @@ fn byte_at(value: &str, index: usize) -> u8 {
 /// Mirror `readUtf8String(reader, length)`.
 fn read_utf8_string(reader: &mut PsdReader, length: usize) -> ReadResult<String> {
     let buffer = read_bytes(reader, length)?;
-    decode_string(&buffer).map_err(|_| ReadError::StrictViolation("Invalid UTF-8".to_string()))
+    Ok(decode_string(&buffer))
 }
 
 /// Mirror `writeUtf8String(writer, value)`.
@@ -124,22 +131,16 @@ fn write_utf8_string(writer: &mut PsdWriter, value: &str) {
 
 /// Mirror `readEncodedString(reader)`.
 ///
-/// Reads a uint8 length, then `length` bytes. If any byte has the high bit set,
-/// upstream decodes as GBK; we have no GBK decoder available, so for that branch
-/// we fall back to a lossy Latin-1-style decode (each byte -> code point) and
-/// note the divergence. Pure-ASCII payloads (the common case) match exactly.
+/// Reads a uint8 length, then `length` bytes. When a byte has the high bit set the
+/// payload is legacy GBK; upstream tries `new TextDecoder('gbk')` and, since v31,
+/// falls back to a plain UTF-8 decode when that decoder is unavailable in the host
+/// runtime. The Rust port has no GBK decoder at all, so it always takes upstream's
+/// fallback path — the same result a browser without the `gbk` label produces.
+/// Pure-ASCII payloads (the common case) are byte-identical either way.
 fn read_encoded_string(reader: &mut PsdReader) -> ReadResult<String> {
     let length = read_uint8(reader)? as usize;
     let buffer = read_bytes(reader, length)?;
-
-    let not_ascii = buffer.iter().any(|&b| b & 0x80 != 0);
-
-    if not_ascii {
-        // DEPENDENCY GAP: no GBK decoder ported; lossy byte->char fallback.
-        Ok(buffer.iter().map(|&b| b as char).collect())
-    } else {
-        decode_string(&buffer).map_err(|_| ReadError::StrictViolation("Invalid UTF-8".to_string()))
-    }
+    Ok(decode_string(&buffer))
 }
 
 /// Mirror `writeEncodedString(writer, value)`.
@@ -179,11 +180,14 @@ fn inte_codec() -> EnumCodec {
     )
 }
 
-/// Mirror `FrmD = createEnum<'auto'|'none'|'dispose'>('FrmD', '', {...})`.
+/// Mirror `FrmD = createEnum<'auto'|'none'|'dispose'>('FrmD', 'auto', {...})`.
+///
+/// The default is the map KEY `'auto'`, not `''`: upstream's original `''` was not a
+/// key, so `encode(None)` resolved `map['']` to `undefined` and emitted `"FrmD."`.
 fn frmd_codec() -> EnumCodec {
     EnumCodec::new(
         "FrmD",
-        "",
+        "auto",
         dict(&[("auto", "Auto"), ("none", "None"), ("dispose", "Disp")]),
     )
 }
@@ -1920,28 +1924,23 @@ mod tests {
         let mut target = ImageResources::default();
         // read the section length, then dispatch with `left`.
         let len = read_uint32(&mut r).unwrap() as usize;
-        let payload_start = r.offset;
         read_image_resource(id, &mut r, &mut target, len).unwrap();
-        // advance to padded end (pad-to-even)
-        let mut end = payload_start + len;
-        if len % 2 != 0 {
-            end += 1;
-        }
-        r.offset = end;
         target
     }
 
     #[test]
     fn resolution_info_round_trip() {
-        let mut target = ImageResources::default();
-        target.resolution_info = Some(ResolutionInfo {
-            horizontal_resolution: 300.0,
-            horizontal_resolution_unit: ResolutionUnit::Ppi,
-            width_unit: DimensionUnit::Inches,
-            vertical_resolution: 300.0,
-            vertical_resolution_unit: ResolutionUnit::Ppcm,
-            height_unit: DimensionUnit::Centimeters,
-        });
+        let target = ImageResources {
+            resolution_info: Some(ResolutionInfo {
+                horizontal_resolution: 300.0,
+                horizontal_resolution_unit: ResolutionUnit::Ppi,
+                width_unit: DimensionUnit::Inches,
+                vertical_resolution: 300.0,
+                vertical_resolution_unit: ResolutionUnit::Ppcm,
+                height_unit: DimensionUnit::Centimeters,
+            }),
+            ..Default::default()
+        };
 
         let mut w = create_writer(64);
         write_image_resource(1005, &mut w, &target, 0).unwrap();
@@ -1963,8 +1962,10 @@ mod tests {
 
     #[test]
     fn xmp_metadata_string_round_trip() {
-        let mut target = ImageResources::default();
-        target.xmp_metadata = Some("<x:xmpmeta>data</x:xmpmeta>".to_string());
+        let target = ImageResources {
+            xmp_metadata: Some("<x:xmpmeta>data</x:xmpmeta>".to_string()),
+            ..Default::default()
+        };
 
         let mut w = create_writer(64);
         write_image_resource(1060, &mut w, &target, 0).unwrap();
@@ -1978,8 +1979,10 @@ mod tests {
 
     #[test]
     fn caption_digest_round_trip() {
-        let mut target = ImageResources::default();
-        target.caption_digest = Some("0123456789abcdef0123456789abcdef".to_string());
+        let target = ImageResources {
+            caption_digest: Some("0123456789abcdef0123456789abcdef".to_string()),
+            ..Default::default()
+        };
 
         let mut w = create_writer(64);
         write_image_resource(1061, &mut w, &target, 0).unwrap();
@@ -1995,8 +1998,10 @@ mod tests {
     #[test]
     fn framing_odd_length_pad() {
         // url resource: ASCII string of odd length forces pad-to-even on the block.
-        let mut target = ImageResources::default();
-        target.url = Some("abc".to_string()); // 3 bytes -> needs 1 pad byte
+        let target = ImageResources {
+            url: Some("abc".to_string()), // 3 bytes -> needs 1 pad byte
+            ..Default::default()
+        };
 
         let bytes = write_block(1035, "", &target, 0);
         // Find the section length and assert payload is padded to even.
@@ -2012,13 +2017,15 @@ mod tests {
 
     #[test]
     fn print_scale_round_trip() {
-        let mut target = ImageResources::default();
-        target.print_scale = Some(PrintScale {
-            style: Some(PrintScaleStyle::UserDefined),
-            x: Some(1.5),
-            y: Some(2.5),
-            scale: Some(0.75),
-        });
+        let target = ImageResources {
+            print_scale: Some(PrintScale {
+                style: Some(PrintScaleStyle::UserDefined),
+                x: Some(1.5),
+                y: Some(2.5),
+                scale: Some(0.75),
+            }),
+            ..Default::default()
+        };
 
         let mut w = create_writer(64);
         write_image_resource(1062, &mut w, &target, 0).unwrap();
@@ -2036,13 +2043,15 @@ mod tests {
 
     #[test]
     fn version_info_round_trip() {
-        let mut target = ImageResources::default();
-        target.version_info = Some(VersionInfo {
-            has_real_merged_data: true,
-            writer_name: "ag-psd".to_string(),
-            reader_name: "ag-psd".to_string(),
-            file_version: 1.0,
-        });
+        let target = ImageResources {
+            version_info: Some(VersionInfo {
+                has_real_merged_data: true,
+                writer_name: "ag-psd".to_string(),
+                reader_name: "ag-psd".to_string(),
+                file_version: 1.0,
+            }),
+            ..Default::default()
+        };
 
         let mut w = create_writer(64);
         write_image_resource(1057, &mut w, &target, 0).unwrap();
@@ -2060,23 +2069,25 @@ mod tests {
 
     #[test]
     fn grid_and_guides_round_trip() {
-        let mut target = ImageResources::default();
-        target.grid_and_guides_information = Some(GridAndGuidesInformation {
-            grid: Some(GridInfo {
-                horizontal: 576.0,
-                vertical: 576.0,
+        let target = ImageResources {
+            grid_and_guides_information: Some(GridAndGuidesInformation {
+                grid: Some(GridInfo {
+                    horizontal: 576.0,
+                    vertical: 576.0,
+                }),
+                guides: Some(vec![
+                    GuideInfo {
+                        location: 10.0,
+                        direction: GuideDirection::Horizontal,
+                    },
+                    GuideInfo {
+                        location: 20.0,
+                        direction: GuideDirection::Vertical,
+                    },
+                ]),
             }),
-            guides: Some(vec![
-                GuideInfo {
-                    location: 10.0,
-                    direction: GuideDirection::Horizontal,
-                },
-                GuideInfo {
-                    location: 20.0,
-                    direction: GuideDirection::Vertical,
-                },
-            ]),
-        });
+            ..Default::default()
+        };
 
         let mut w = create_writer(64);
         write_image_resource(1032, &mut w, &target, 0).unwrap();
@@ -2098,8 +2109,10 @@ mod tests {
 
     #[test]
     fn alpha_identifiers_round_trip() {
-        let mut target = ImageResources::default();
-        target.alpha_identifiers = Some(vec![1.0, 2.0, 3.0]);
+        let target = ImageResources {
+            alpha_identifiers: Some(vec![1.0, 2.0, 3.0]),
+            ..Default::default()
+        };
 
         let mut w = create_writer(64);
         write_image_resource(1053, &mut w, &target, 0).unwrap();
@@ -2113,12 +2126,14 @@ mod tests {
 
     #[test]
     fn url_list_round_trip() {
-        let mut target = ImageResources::default();
-        target.urls_list = Some(vec![UrlListItem {
-            id: 7.0,
-            r#ref: "slice".to_string(),
-            url: "http://example.com".to_string(),
-        }]);
+        let target = ImageResources {
+            urls_list: Some(vec![UrlListItem {
+                id: 7.0,
+                r#ref: "slice".to_string(),
+                url: "http://example.com".to_string(),
+            }]),
+            ..Default::default()
+        };
 
         let mut w = create_writer(128);
         write_image_resource(1054, &mut w, &target, 0).unwrap();
@@ -2136,8 +2151,10 @@ mod tests {
 
     #[test]
     fn pixel_aspect_ratio_round_trip() {
-        let mut target = ImageResources::default();
-        target.pixel_aspect_ratio = Some(PixelAspectRatio { aspect: 1.25 });
+        let target = ImageResources {
+            pixel_aspect_ratio: Some(PixelAspectRatio { aspect: 1.25 }),
+            ..Default::default()
+        };
 
         let mut w = create_writer(64);
         write_image_resource(1064, &mut w, &target, 0).unwrap();
@@ -2151,27 +2168,29 @@ mod tests {
 
     #[test]
     fn animations_round_trip() {
-        let mut target = ImageResources::default();
-        target.animations = Some(Animations {
-            frames: vec![
-                AnimationFrameInfo {
-                    id: 1.0,
-                    delay: 0.1,
-                    dispose: Some(AnimationDispose::Auto),
-                },
-                AnimationFrameInfo {
-                    id: 2.0,
-                    delay: 0.0,
-                    dispose: Some(AnimationDispose::None),
-                },
-            ],
-            animations: vec![AnimationInfo {
-                id: 10.0,
-                frames: vec![1.0, 2.0],
-                repeats: Some(3.0),
-                active_frame: Some(1.0),
-            }],
-        });
+        let target = ImageResources {
+            animations: Some(Animations {
+                frames: vec![
+                    AnimationFrameInfo {
+                        id: 1.0,
+                        delay: 0.1,
+                        dispose: Some(AnimationDispose::Auto),
+                    },
+                    AnimationFrameInfo {
+                        id: 2.0,
+                        delay: 0.0,
+                        dispose: Some(AnimationDispose::None),
+                    },
+                ],
+                animations: vec![AnimationInfo {
+                    id: 10.0,
+                    frames: vec![1.0, 2.0],
+                    repeats: Some(3.0),
+                    active_frame: Some(1.0),
+                }],
+            }),
+            ..Default::default()
+        };
 
         let mut w = create_writer(512);
         write_image_resource(4000, &mut w, &target, 0).unwrap();
@@ -2193,49 +2212,51 @@ mod tests {
 
     #[test]
     fn slices_round_trip() {
-        let mut target = ImageResources::default();
-        target.slices = Some(vec![SliceGroup {
-            bounds: LtrbBounds {
-                left: 0.0,
-                top: 0.0,
-                right: 100.0,
-                bottom: 80.0,
-            },
-            group_name: "group".to_string(),
-            slices: vec![Slice {
-                id: 1.0,
-                group_id: 0.0,
-                origin: Some(SliceOrigin::UserGenerated),
-                associated_layer_id: 0.0,
-                name: Some("slice 1".to_string()),
-                slice_type: Some(SliceType::Image),
+        let target = ImageResources {
+            slices: Some(vec![SliceGroup {
                 bounds: LtrbBounds {
-                    left: 1.0,
-                    top: 2.0,
-                    right: 3.0,
-                    bottom: 4.0,
+                    left: 0.0,
+                    top: 0.0,
+                    right: 100.0,
+                    bottom: 80.0,
                 },
-                url: "u".to_string(),
-                target: "t".to_string(),
-                message: "m".to_string(),
-                alt_tag: "a".to_string(),
-                cell_text_is_html: true,
-                cell_text: "c".to_string(),
-                horizontal_alignment: Some(SliceAlignment::Default),
-                vertical_alignment: Some(SliceAlignment::Default),
-                background_color_type: Some(SliceBackgroundColorType::None),
-                background_color: Rgba {
-                    r: 0.0,
-                    g: 0.0,
-                    b: 0.0,
-                    a: 0.0,
-                },
-                top_outset: None,
-                left_outset: None,
-                bottom_outset: None,
-                right_outset: None,
-            }],
-        }]);
+                group_name: "group".to_string(),
+                slices: vec![Slice {
+                    id: 1.0,
+                    group_id: 0.0,
+                    origin: Some(SliceOrigin::UserGenerated),
+                    associated_layer_id: 0.0,
+                    name: Some("slice 1".to_string()),
+                    slice_type: Some(SliceType::Image),
+                    bounds: LtrbBounds {
+                        left: 1.0,
+                        top: 2.0,
+                        right: 3.0,
+                        bottom: 4.0,
+                    },
+                    url: "u".to_string(),
+                    target: "t".to_string(),
+                    message: "m".to_string(),
+                    alt_tag: "a".to_string(),
+                    cell_text_is_html: true,
+                    cell_text: "c".to_string(),
+                    horizontal_alignment: Some(SliceAlignment::Default),
+                    vertical_alignment: Some(SliceAlignment::Default),
+                    background_color_type: Some(SliceBackgroundColorType::None),
+                    background_color: Rgba {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 0.0,
+                    },
+                    top_outset: None,
+                    left_outset: None,
+                    bottom_outset: None,
+                    right_outset: None,
+                }],
+            }]),
+            ..Default::default()
+        };
 
         let mut w = create_writer(1024);
         write_image_resource(1050, &mut w, &target, 0).unwrap();
@@ -2255,26 +2276,28 @@ mod tests {
         assert_eq!(s.name.as_deref(), Some("slice 1"));
         assert_eq!(s.slice_type, Some(SliceType::Image));
         assert_eq!(s.url, "u");
-        assert_eq!(s.cell_text_is_html, true);
+        assert!(s.cell_text_is_html);
         assert_eq!(s.bounds.left, 1.0);
         assert_eq!(s.bounds.bottom, 4.0);
     }
 
     #[test]
     fn print_information_round_trip() {
-        let mut target = ImageResources::default();
-        target.print_information = Some(PrintInformation {
-            printer_manages_colors: None,
-            printer_name: Some("My Printer".to_string()),
-            printer_profile: Some("sRGB".to_string()),
-            print_sixteen_bit: Some(false),
-            rendering_intent: Some(RenderingIntent::RelativeColorimetric),
-            hard_proof: Some(true),
-            black_point_compensation: Some(true),
-            proof_setup: Some(ProofSetup::Builtin {
-                builtin: "proofCMYK".to_string(),
+        let target = ImageResources {
+            print_information: Some(PrintInformation {
+                printer_manages_colors: None,
+                printer_name: Some("My Printer".to_string()),
+                printer_profile: Some("sRGB".to_string()),
+                print_sixteen_bit: Some(false),
+                rendering_intent: Some(RenderingIntent::RelativeColorimetric),
+                hard_proof: Some(true),
+                black_point_compensation: Some(true),
+                proof_setup: Some(ProofSetup::Builtin {
+                    builtin: "proofCMYK".to_string(),
+                }),
             }),
-        });
+            ..Default::default()
+        };
 
         let mut w = create_writer(512);
         write_image_resource(1082, &mut w, &target, 0).unwrap();
@@ -2292,5 +2315,79 @@ mod tests {
             Some(ProofSetup::Builtin { builtin }) => assert_eq!(builtin, "proofCMYK"),
             _ => panic!("expected builtin proof setup"),
         }
+    }
+
+    // -- charToNibble / byteAt --------------------------------------------------
+
+    #[test]
+    fn char_to_nibble_decodes_all_three_hex_ranges() {
+        for (i, c) in b"0123456789".iter().enumerate() {
+            assert_eq!(char_to_nibble(*c), u8::try_from(i).unwrap());
+        }
+        for (i, c) in b"abcdef".iter().enumerate() {
+            assert_eq!(char_to_nibble(*c), u8::try_from(i).unwrap() + 10);
+        }
+        // Uppercase used to fall into the lowercase branch and underflow/garble.
+        for (i, c) in b"ABCDEF".iter().enumerate() {
+            assert_eq!(char_to_nibble(*c), u8::try_from(i).unwrap() + 10);
+        }
+    }
+
+    #[test]
+    fn byte_at_accepts_uppercase_hex() {
+        assert_eq!(byte_at("FF", 0), 0xff);
+        assert_eq!(byte_at("ff", 0), 0xff);
+        assert_eq!(byte_at("A0", 0), 0xa0);
+        assert_eq!(byte_at("00ff", 2), 0xff);
+    }
+
+    // -- enum codec defaults ----------------------------------------------------
+
+    #[test]
+    fn every_enum_codec_default_is_a_map_key() {
+        // A default that is one of the map VALUES makes `encode(None)` emit an empty
+        // code. Upstream caught this class with types; here it is a test plus the
+        // debug assertion in `EnumCodec::new`.
+        for codec in [
+            inte_codec(),
+            frmd_codec(),
+            eslice_type_codec(),
+            eslice_horz_codec(),
+            eslice_vert_codec(),
+            eslice_origin_codec(),
+            eslice_bg_codec(),
+        ] {
+            assert!(codec.default_is_valid());
+        }
+    }
+
+    #[test]
+    fn frmd_default_encodes_to_auto() {
+        // Was `''`, which is not a map key, so `encode(None)` produced "FrmD.".
+        assert_eq!(frmd_codec().encode(None).unwrap(), "FrmD.Auto");
+        assert_eq!(frmd_codec().decode("FrmD").unwrap(), "auto");
+    }
+
+    #[test]
+    fn frmd_decodes_photoshop_2026_long_form() {
+        assert_eq!(frmd_codec().decode("FrmD.Disp").unwrap(), "dispose");
+        assert_eq!(frmd_codec().decode("FrmD.dispose").unwrap(), "dispose");
+    }
+
+    // -- readEncodedString ------------------------------------------------------
+
+    #[test]
+    fn read_encoded_string_reads_ascii_and_utf8() {
+        let mut bytes = vec![5u8];
+        bytes.extend_from_slice(b"hello");
+        let mut r = PsdReader::new(&bytes, None, None);
+        assert_eq!(read_encoded_string(&mut r).unwrap(), "hello");
+
+        // High-bit payload: no GBK decoder here, so upstream's fallback (UTF-8) applies.
+        let text = "\u{0142}\u{0105}"; // 4 UTF-8 bytes
+        let mut bytes = vec![u8::try_from(text.len()).unwrap()];
+        bytes.extend_from_slice(text.as_bytes());
+        let mut r = PsdReader::new(&bytes, None, None);
+        assert_eq!(read_encoded_string(&mut r).unwrap(), text);
     }
 }

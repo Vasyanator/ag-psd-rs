@@ -904,6 +904,12 @@ fn write_brit(writer: &mut PsdWriter, a: Option<&AdjustmentLayer>) {
     write_zeros(writer, 1);
 }
 
+/// Writes the `levl` payload: version 2 followed by 63 fixed-size channel
+/// records in the order rgb, red, green, blue and then 59 default records.
+///
+/// Missing channels are written as the neutral default so the record count
+/// stays constant; a non-Levels adjustment is a no-op (the dispatcher only
+/// calls this once `has` reported the key).
 fn write_levl(writer: &mut PsdWriter, a: Option<&AdjustmentLayer>) {
     let info = match a {
         Some(AdjustmentLayer::Levels(l)) => l,
@@ -918,10 +924,13 @@ fn write_levl(writer: &mut PsdWriter, a: Option<&AdjustmentLayer>) {
     };
 
     write_uint16(writer, 2); // version
+    // Channel order is fixed by the format and must match `read_levl`:
+    // rgb, red, green, blue. Emitting blue before green silently swaps the two
+    // channels on every round trip.
     write_levels_channel(writer, info.rgb.as_ref().unwrap_or(&default));
     write_levels_channel(writer, info.red.as_ref().unwrap_or(&default));
-    write_levels_channel(writer, info.blue.as_ref().unwrap_or(&default));
     write_levels_channel(writer, info.green.as_ref().unwrap_or(&default));
+    write_levels_channel(writer, info.blue.as_ref().unwrap_or(&default));
     for _ in 0..59 {
         write_levels_channel(writer, &default);
     }
@@ -1361,12 +1370,15 @@ fn desc_enum_value(desc: &Descriptor, key: &str) -> Option<String> {
 // CONSOLIDATION GAP — enum codecs (createEnum decode/encode), inline
 // ===========================================================================
 
+/// Mirror `colorLookupType.decode`. Accepts the historical code and, since
+/// Photoshop 2026, the long-form map key (`3dlut`); unknown values fall back to the
+/// `3dlut` default, as upstream's `def` does.
 fn color_lookup_type_decode(value: &str) -> Option<ColorLookupType> {
     match value {
-        "3DLUT" => Some(ColorLookupType::Lut3D),
+        "3DLUT" | "3dlut" => Some(ColorLookupType::Lut3D),
         "abstractProfile" => Some(ColorLookupType::AbstractProfile),
         "deviceLinkProfile" => Some(ColorLookupType::DeviceLinkProfile),
-        _ => Some(ColorLookupType::Lut3D), // default '3DLUT'
+        _ => Some(ColorLookupType::Lut3D), // default '3dlut'
     }
 }
 
@@ -1379,11 +1391,13 @@ fn color_lookup_type_encode(value: ColorLookupType) -> String {
     format!("colorLookupType.{v}")
 }
 
+/// Mirror `LUTFormatType.decode`; the second arm of each pattern is the long-form
+/// map key Photoshop 2026 writes instead of the historical code.
 fn lut_format_decode(value: &str) -> Option<LutFormat> {
     match value {
-        "LUTFormatLOOK" => Some(LutFormat::Look),
-        "LUTFormatCUBE" => Some(LutFormat::Cube),
-        "LUTFormat3DL" => Some(LutFormat::ThreeDl),
+        "LUTFormatLOOK" | "look" => Some(LutFormat::Look),
+        "LUTFormatCUBE" | "cube" => Some(LutFormat::Cube),
+        "LUTFormat3DL" | "3dl" => Some(LutFormat::ThreeDl),
         _ => Some(LutFormat::Look), // default 'look'
     }
 }
@@ -1397,10 +1411,12 @@ fn lut_format_encode(value: LutFormat) -> String {
     format!("LUTFormatType.{v}")
 }
 
+/// Mirror `colorLookupOrder.decode`; the second arm of each pattern is the long-form
+/// map key Photoshop 2026 writes instead of the historical code.
 fn color_lookup_order_decode(value: &str) -> Option<RgbBgrOrder> {
     match value {
-        "rgbOrder" => Some(RgbBgrOrder::Rgb),
-        "bgrOrder" => Some(RgbBgrOrder::Bgr),
+        "rgbOrder" | "rgb" => Some(RgbBgrOrder::Rgb),
+        "bgrOrder" | "bgr" => Some(RgbBgrOrder::Bgr),
         _ => Some(RgbBgrOrder::Rgb), // default 'rgb'
     }
 }
@@ -1413,12 +1429,14 @@ fn color_lookup_order_encode(value: RgbBgrOrder) -> String {
     format!("colorLookupOrder.{v}")
 }
 
+/// Mirror `gradientInterpolationMethodType.decode`; the second arm of each pattern is
+/// the long-form map key Photoshop 2026 writes instead of the historical code.
 fn gradient_interpolation_method_decode(value: &str) -> Option<InterpolationMethod> {
     match value {
-        "Perc" => Some(InterpolationMethod::Perceptual),
-        "Lnr " => Some(InterpolationMethod::Linear),
-        "Gcls" => Some(InterpolationMethod::Classic),
-        "Smoo" => Some(InterpolationMethod::Smooth),
+        "Perc" | "perceptual" => Some(InterpolationMethod::Perceptual),
+        "Lnr " | "linear" => Some(InterpolationMethod::Linear),
+        "Gcls" | "classic" => Some(InterpolationMethod::Classic),
+        "Smoo" | "smooth" => Some(InterpolationMethod::Smooth),
         _ => Some(InterpolationMethod::Perceptual), // default 'perceptual'
     }
 }
@@ -1445,6 +1463,10 @@ fn grdm_color_model_index(model: GradientColorModel) -> u16 {
         GradientColorModel::Rgb => "rgb",
         GradientColorModel::Hsb => "hsb",
         GradientColorModel::Lab => "lab",
+        // `grdm`'s binary color-model table has no `hsl` slot (upstream types the
+        // field as 'rgb'|'hsb'|'lab'); the lookup below misses and writes the rgb
+        // slot, which is upstream's `indexOf(...) === -1 -> 3` behaviour.
+        GradientColorModel::Hsl => "hsl",
     };
     match GRDM_COLOR_MODELS.iter().position(|m| *m == name) {
         Some(i) => i as u16,
@@ -1498,26 +1520,28 @@ mod tests {
 
     #[test]
     fn round_trip_levl_binary() {
-        let mut info = LayerAdditionalInfo::default();
-        info.adjustment = Some(AdjustmentLayer::Levels(LevelsAdjustment {
-            preset: PresetInfo::default(),
-            rgb: Some(LevelsAdjustmentChannel {
-                shadow_input: 5.0,
-                highlight_input: 250.0,
-                shadow_output: 10.0,
-                highlight_output: 245.0,
-                midtone_input: 1.2,
-            }),
-            red: Some(LevelsAdjustmentChannel {
-                shadow_input: 1.0,
-                highlight_input: 254.0,
-                shadow_output: 0.0,
-                highlight_output: 255.0,
-                midtone_input: 0.9,
-            }),
-            green: None,
-            blue: None,
-        }));
+        let info = LayerAdditionalInfo {
+            adjustment: Some(AdjustmentLayer::Levels(LevelsAdjustment {
+                preset: PresetInfo::default(),
+                rgb: Some(LevelsAdjustmentChannel {
+                    shadow_input: 5.0,
+                    highlight_input: 250.0,
+                    shadow_output: 10.0,
+                    highlight_output: 245.0,
+                    midtone_input: 1.2,
+                }),
+                red: Some(LevelsAdjustmentChannel {
+                    shadow_input: 1.0,
+                    highlight_input: 254.0,
+                    shadow_output: 0.0,
+                    highlight_output: 255.0,
+                    midtone_input: 0.9,
+                }),
+                green: None,
+                blue: None,
+            })),
+            ..LayerAdditionalInfo::default()
+        };
 
         let out = round_trip("levl", &info);
         match out.adjustment {
@@ -1539,17 +1563,55 @@ mod tests {
         }
     }
 
+    /// Guards the `levl` channel order: the writer must emit rgb, red, green,
+    /// blue in that order, otherwise green and blue are swapped on every round
+    /// trip. Each channel carries a distinct marker value so a swap is visible.
+    #[test]
+    fn round_trip_levl_keeps_channel_order() {
+        let channel = |marker: f64| LevelsAdjustmentChannel {
+            shadow_input: marker,
+            highlight_input: 255.0 - marker,
+            shadow_output: marker * 2.0,
+            highlight_output: 255.0,
+            midtone_input: 1.0,
+        };
+
+        let info = LayerAdditionalInfo {
+            adjustment: Some(AdjustmentLayer::Levels(LevelsAdjustment {
+                preset: PresetInfo::default(),
+                rgb: Some(channel(1.0)),
+                red: Some(channel(2.0)),
+                green: Some(channel(3.0)),
+                blue: Some(channel(4.0)),
+            })),
+            ..LayerAdditionalInfo::default()
+        };
+
+        let out = round_trip("levl", &info);
+        match out.adjustment {
+            Some(AdjustmentLayer::Levels(l)) => {
+                assert_eq!(l.rgb.expect("rgb").shadow_input, 1.0);
+                assert_eq!(l.red.expect("red").shadow_input, 2.0);
+                assert_eq!(l.green.expect("green").shadow_input, 3.0);
+                assert_eq!(l.blue.expect("blue").shadow_input, 4.0);
+            }
+            other => panic!("expected levels, got {other:?}"),
+        }
+    }
+
     #[test]
     fn round_trip_brit_binary() {
-        let mut info = LayerAdditionalInfo::default();
-        info.adjustment = Some(AdjustmentLayer::Brightness(BrightnessAdjustment {
-            brightness: Some(20.0),
-            contrast: Some(-15.0),
-            mean_value: Some(127.0),
-            lab_color_only: Some(true),
-            use_legacy: Some(true),
-            auto: None,
-        }));
+        let info = LayerAdditionalInfo {
+            adjustment: Some(AdjustmentLayer::Brightness(BrightnessAdjustment {
+                brightness: Some(20.0),
+                contrast: Some(-15.0),
+                mean_value: Some(127.0),
+                lab_color_only: Some(true),
+                use_legacy: Some(true),
+                auto: None,
+            })),
+            ..LayerAdditionalInfo::default()
+        };
 
         let out = round_trip("brit", &info);
         match out.adjustment {
@@ -1566,11 +1628,13 @@ mod tests {
 
     #[test]
     fn round_trip_vibance_descriptor() {
-        let mut info = LayerAdditionalInfo::default();
-        info.adjustment = Some(AdjustmentLayer::Vibrance(VibranceAdjustment {
-            vibrance: Some(30.0),
-            saturation: Some(-10.0),
-        }));
+        let info = LayerAdditionalInfo {
+            adjustment: Some(AdjustmentLayer::Vibrance(VibranceAdjustment {
+                vibrance: Some(30.0),
+                saturation: Some(-10.0),
+            })),
+            ..LayerAdditionalInfo::default()
+        };
 
         let out = round_trip("vibA", &info);
         match out.adjustment {
@@ -1584,19 +1648,24 @@ mod tests {
 
     #[test]
     fn round_trip_blwh_descriptor() {
-        let mut info = LayerAdditionalInfo::default();
-        let mut adj = BlackAndWhiteAdjustment::default();
-        adj.reds = Some(40.0);
-        adj.yellows = Some(60.0);
-        adj.greens = Some(40.0);
-        adj.cyans = Some(60.0);
-        adj.blues = Some(20.0);
-        adj.magentas = Some(80.0);
-        adj.use_tint = Some(true);
-        adj.tint_color = Some(Color::Rgb(Rgb { r: 225.0, g: 211.0, b: 179.0 }));
-        adj.preset.preset_kind = Some(1.0);
-        adj.preset.preset_file_name = Some(String::new());
-        info.adjustment = Some(AdjustmentLayer::BlackAndWhite(adj));
+        let adj = BlackAndWhiteAdjustment {
+            reds: Some(40.0),
+            yellows: Some(60.0),
+            greens: Some(40.0),
+            cyans: Some(60.0),
+            blues: Some(20.0),
+            magentas: Some(80.0),
+            use_tint: Some(true),
+            tint_color: Some(Color::Rgb(Rgb { r: 225.0, g: 211.0, b: 179.0 })),
+            preset: PresetInfo {
+                preset_kind: Some(1.0),
+                preset_file_name: Some(String::new()),
+            },
+        };
+        let info = LayerAdditionalInfo {
+            adjustment: Some(AdjustmentLayer::BlackAndWhite(adj)),
+            ..LayerAdditionalInfo::default()
+        };
 
         let out = round_trip("blwh", &info);
         match out.adjustment {
@@ -1616,5 +1685,25 @@ mod tests {
             }
             other => panic!("expected black & white, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn inline_enum_codecs_accept_photoshop_2026_long_form() {
+        // Photoshop 2026 writes the long-form map KEY instead of the historical code;
+        // before this these fell through to the default and lost the real value.
+        assert_eq!(lut_format_decode("LUTFormatCUBE"), Some(LutFormat::Cube));
+        assert_eq!(lut_format_decode("cube"), Some(LutFormat::Cube));
+        assert_eq!(lut_format_decode("3dl"), Some(LutFormat::ThreeDl));
+        assert_eq!(color_lookup_order_decode("bgrOrder"), Some(RgbBgrOrder::Bgr));
+        assert_eq!(color_lookup_order_decode("bgr"), Some(RgbBgrOrder::Bgr));
+        assert_eq!(color_lookup_type_decode("3dlut"), Some(ColorLookupType::Lut3D));
+        assert_eq!(
+            gradient_interpolation_method_decode("classic"),
+            Some(InterpolationMethod::Classic)
+        );
+        assert_eq!(
+            gradient_interpolation_method_decode("Gcls"),
+            Some(InterpolationMethod::Classic)
+        );
     }
 }

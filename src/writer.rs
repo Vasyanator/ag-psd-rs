@@ -10,6 +10,23 @@ Source compatibility:
 Main responsibilities:
 - зеркалировать соответствующий upstream-модуль при портировании;
 - держать публичный контракт этого участка в одном месте.
+
+Notes:
+- The RLE scratch buffer (`PsdWriter::temp_buffer`) is shared by every channel
+  encode in the document. It is sized once in `write_psd_to_writer` from
+  `get_largest_layer_size` (which measures every layer plus its `mask` and
+  `real_mask`) and the composite estimate. `write_data_rle` silently drops
+  out-of-bounds writes, so undersizing this buffer corrupts output instead of
+  failing — see `rle_scratch_size`, which also documents why the PSB sizing
+  deliberately diverges from upstream.
+- Every RLE row-length table entry is 4 bytes in PSB and 2 in PSD, so all
+  scratch sizing must be told whether the document is PSB. Paths that encode
+  through the shared buffer: the layer bitmap (`get_layer_channels`), the mask
+  and real mask (`get_mask_channels`) and the composite (`write_image_data`).
+  `write_pattern` encodes into its own local buffer, and the `Layer::raw_data`
+  verbatim path does not encode at all.
+- `get_channels` has a verbatim fast path for `Layer::raw_data` (channels read
+  with `ReadOptions::use_raw_data`): they are written back without decoding.
 */
 
 // PORT STATUS: primitives ported; document orchestration ported.
@@ -453,11 +470,13 @@ pub fn write_pattern(writer: &mut PsdWriter, pattern: &PatternInfo) {
             continue;
         }
 
-        // worst-case RLE size for a single channel
-        let mut buffer = vec![
-            0u8;
-            (width * height + 2 * height + 2 * width + 16) as usize
-        ];
+        // Worst-case RLE size for a single channel. Patterns always use the
+        // short (PSD) row-length table, hence `large = false`. Upstream sizes
+        // this as `width * height + 2 * height + 2 * width + 16`, which is not a
+        // bound for tall, narrow channels (the `2 * width + 16` slack does not
+        // cover the ~`height / 128` run headers) and overflows `u32` on large
+        // patterns; `rle_scratch_size` is a proven bound in saturating usize.
+        let mut buffer = vec![0u8; rle_scratch_size(width, height, 1, false)];
         let data = write_data_rle(&mut buffer, &pixel_data, &[offset as usize], false)
             .expect("write_data_rle returned None for pattern channel");
 
@@ -489,21 +508,80 @@ pub fn write_pattern(writer: &mut PsdWriter, pattern: &PatternInfo) {
 // Document orchestration (port of psdWriter.ts writePsd & friends)
 // ===========================================================================
 
+/// Byte width of one entry of the RLE per-row length table.
+///
+/// PSB (`large`) stores row lengths as `u32`, PSD as `u16`; this must match what
+/// `helpers::write_data_rle` emits for the same `large` flag.
+const fn rle_row_length_entry_size(large: bool) -> usize {
+    if large {
+        4
+    } else {
+        2
+    }
+}
+
+/// Worst-case size of the RLE scratch buffer for `channel_count` channels of a
+/// `width` x `height` bitmap, encoded with `large` row lengths (PSB).
+///
+/// Two terms per channel: `height * entry_size` for the per-row length table and
+/// `2 * width * height` for a pathological, fully incompressible channel (RLE
+/// never expands a row past ~`width * 129 / 128`, so twice the row is a safe
+/// bound). Saturating arithmetic keeps an absurd bitmap from wrapping the size
+/// instead of failing loudly at allocation time.
+///
+/// DELIBERATE DIVERGENCE FROM UPSTREAM — do not "restore" on the next sync.
+/// Upstream (`getLargestLayerSize` / `writePsd` in `psdWriter.ts`) hardcodes
+/// `2 * height` for the length table and ignores the PSB flag, so every PSB
+/// scratch buffer is short by `2 * height` bytes per channel. Upstream does not
+/// notice because `writeDataRLE` writes into a `Uint8Array`: out-of-bounds
+/// writes are silently dropped and the result is truncated, which turns the
+/// shortfall into structurally valid but incomplete channel data instead of an
+/// error. Shipping known output corruption is worse than a documented deviation,
+/// so the entry size is computed from `large` here.
+fn rle_scratch_size(width: u32, height: u32, channel_count: usize, large: bool) -> usize {
+    // u32 -> usize is a widening conversion on both supported targets
+    // (x86_64-unknown-linux-gnu / x86_64-pc-windows-gnu), so nothing is lost.
+    let w = width as usize;
+    let h = height as usize;
+    let table = h.saturating_mul(rle_row_length_entry_size(large));
+    let data = 2usize.saturating_mul(w).saturating_mul(h);
+    table.saturating_add(data).saturating_mul(channel_count)
+}
+
 /// Порт `getLargestLayerSize(layers)`.
-fn get_largest_layer_size(layers: Option<&[Layer]>) -> usize {
+///
+/// Returns the largest single-channel RLE scratch size required by any layer in
+/// the tree. Every layer is measured — including layers with no bitmap of their
+/// own — together with its `mask` and `real_mask`, because those are encoded
+/// through the same shared scratch buffer and may be larger than the layer.
+/// `large` is the PSB flag of the document being written; it selects the width
+/// of the per-row length table entries (see `rle_scratch_size`).
+fn get_largest_layer_size(layers: Option<&[Layer]>, large: bool) -> usize {
     let mut max = 0usize;
     let layers = match layers {
         Some(l) => l,
         None => return 0,
     };
     for layer in layers {
-        if layer.canvas.is_some() || layer.image_data.is_some() {
-            let (width, height) = get_layer_dimensions(layer.canvas.as_ref(), layer.image_data.as_ref());
-            let (w, h) = (width as usize, height as usize);
-            max = max.max(2 * h + 2 * w * h);
+        let (width, height) =
+            get_layer_dimensions(layer.canvas.as_ref(), layer.image_data.as_ref());
+        // Layer bitmaps and masks are encoded one channel at a time
+        // (`get_layer_channels` / `get_mask_channels` pass a single offset).
+        max = max.max(rle_scratch_size(width, height, 1, large));
+
+        if let Some(mask) = &layer.additional_info.mask {
+            let (width, height) = get_layer_dimensions(mask.canvas.as_ref(), mask.image_data.as_ref());
+            max = max.max(rle_scratch_size(width, height, 1, large));
         }
+
+        if let Some(real_mask) = &layer.additional_info.real_mask {
+            let (width, height) =
+                get_layer_dimensions(real_mask.canvas.as_ref(), real_mask.image_data.as_ref());
+            max = max.max(rle_scratch_size(width, height, 1, large));
+        }
+
         if let Some(children) = &layer.children {
-            max = max.max(get_largest_layer_size(Some(children)));
+            max = max.max(get_largest_layer_size(Some(children), large));
         }
     }
     max
@@ -573,9 +651,19 @@ pub fn write_psd_to_writer(writer: &mut PsdWriter, psd: &Psd, options: &WriteOpt
 
     let global_alpha = image_data.map(has_alpha).unwrap_or(false);
 
-    let max_buffer_size = get_largest_layer_size(psd.children.as_deref()).max(
-        4 * 2 * (psd.width as usize) * (psd.height as usize) + 2 * (psd.height as usize),
+    // The composite is encoded in one `write_data_rle` call over all of its
+    // channels (3, or 4 with global alpha), so its scratch requirement scales
+    // with the channel count — including the per-row length table, which
+    // upstream's estimate charges only once. Size for 4 channels
+    // unconditionally: it is the maximum the composite writer can ask for.
+    const COMPOSITE_MAX_CHANNELS: usize = 4;
+    let composite_size = rle_scratch_size(
+        psd.width as u32,
+        psd.height as u32,
+        COMPOSITE_MAX_CHANNELS,
+        psb,
     );
+    let max_buffer_size = get_largest_layer_size(psd.children.as_deref(), psb).max(composite_size);
     writer.temp_buffer = Some(vec![0u8; max_buffer_size]);
 
     // header
@@ -771,7 +859,7 @@ fn write_layer_info(
                 write_uint16(w, layer_data.channels.len() as u16);
 
                 for c in &layer_data.channels {
-                    write_int16(w, c.channel_id as i16);
+                    write_int16(w, c.id as i16);
                     if psb {
                         write_uint32(w, 0);
                     }
@@ -779,7 +867,9 @@ fn write_layer_info(
                 }
 
                 write_signature(w, "8BIM");
-                let blend = layer.blend_mode.map(from_blend_mode).unwrap_or("norm");
+                // Mirror `fromBlendMode[layer.blendMode!] || 'norm'`: descriptor-only
+                // modes have no legacy signature and fall back to 'norm'.
+                let blend = layer.blend_mode.and_then(from_blend_mode).unwrap_or("norm");
                 write_signature(w, blend);
                 write_uint8(w, (clamp(layer.opacity.unwrap_or(1.0), 0.0, 1.0) * 255.0).round() as u8);
                 write_uint8(w, if layer.clipping == Some(true) { 1 } else { 0 });
@@ -792,7 +882,7 @@ fn write_layer_info(
                     flags |= 0x02;
                 }
                 let info = &layer.additional_info;
-                let section_irrelevant = info.section_divider.as_ref().map_or(false, |sd| {
+                let section_irrelevant = info.section_divider.as_ref().is_some_and(|sd| {
                     sd.divider_type != SectionDividerType::Other
                 });
                 if info.vector_mask.is_some() || section_irrelevant || info.adjustment.is_some() {
@@ -825,7 +915,7 @@ fn write_layer_info(
             for layer_data in &mut layers_data {
                 for channel in &layer_data.channels {
                     write_uint16(w, channel.compression as u16);
-                    if let Some(buffer) = &channel.buffer {
+                    if let Some(buffer) = &channel.data {
                         write_bytes(w, Some(buffer));
                     }
                 }
@@ -979,7 +1069,9 @@ fn write_global_layer_mask_info(writer: &mut PsdWriter, info: Option<&GlobalLaye
                 write_uint16(w, info.color_space2 as u16);
                 write_uint16(w, info.color_space3 as u16);
                 write_uint16(w, info.color_space4 as u16);
-                write_uint16(w, (info.opacity * 0xff as f64) as u16);
+                // `round`, not truncation: the reader divides by 0xff, so
+                // truncating turns 0.5 into 127/255 and breaks the round trip.
+                write_uint16(w, (info.opacity * 0xff as f64).round() as u16);
                 write_uint8(w, info.kind as u8);
                 write_zeros(w, 3);
             }
@@ -1023,7 +1115,12 @@ fn add_children(layers: &mut Vec<Layer>, children: Option<&[Layer]>) {
             if folder.blend_mode == Some(BlendMode::PassThrough) {
                 folder.blend_mode = Some(BlendMode::Normal);
             }
-            let key = c.blend_mode.map(from_blend_mode).unwrap_or("pass").to_string();
+            // Mirror `fromBlendMode[c.blendMode!] || 'pass'`.
+            let key = c
+                .blend_mode
+                .and_then(from_blend_mode)
+                .unwrap_or("pass")
+                .to_string();
             folder.additional_info.section_divider = Some(crate::psd::SectionDivider {
                 divider_type: if c.opened == Some(false) {
                     SectionDividerType::ClosedFolder
@@ -1040,7 +1137,29 @@ fn add_children(layers: &mut Vec<Layer>, children: Option<&[Layer]>) {
     }
 }
 
+/// Порт `bounds(obj)` — прямоугольник из необязательных координат; отсутствующая
+/// координата трактуется как 0 (upstream `obj.top || 0`).
+fn bounds_or_zero(
+    top: Option<f64>,
+    left: Option<f64>,
+    bottom: Option<f64>,
+    right: Option<f64>,
+) -> ChannelBounds {
+    ChannelBounds {
+        top: top.unwrap_or(0.0) as i32,
+        left: left.unwrap_or(0.0) as i32,
+        right: right.unwrap_or(0.0) as i32,
+        bottom: bottom.unwrap_or(0.0) as i32,
+    }
+}
+
 /// Порт `getChannels(tempBuffer, layer, background, options)`.
+///
+/// If the layer still carries undecoded channel payloads (`Layer::raw_data`,
+/// produced by the reader under `ReadOptions::use_raw_data`), they are written
+/// back verbatim: no decode, no re-encode, and bounds are taken from the layer
+/// and its masks as-is. Otherwise the layer bitmap and masks are encoded through
+/// `temp_buffer`.
 fn get_channels(
     temp_buffer: &mut [u8],
     layer: &Layer,
@@ -1048,6 +1167,41 @@ fn get_channels(
     options: &WriteOptions,
     psb: bool,
 ) -> LayerChannelData {
+    if let Some(raw) = &layer.raw_data {
+        // Verbatim path: `length` is recomputed (2 compression bytes + payload)
+        // because the record header must match what we are about to emit.
+        let channels = raw
+            .channels
+            .iter()
+            .map(|c| ChannelData {
+                id: c.id,
+                compression: c.compression,
+                data: c.data.clone(),
+                length: 2 + c.data.as_ref().map_or(0, Vec::len),
+            })
+            .collect();
+
+        let b = bounds_or_zero(layer.top, layer.left, layer.bottom, layer.right);
+        return LayerChannelData {
+            layer: layer.clone(),
+            channels,
+            top: b.top,
+            left: b.left,
+            right: b.right,
+            bottom: b.bottom,
+            mask: layer
+                .additional_info
+                .mask
+                .as_ref()
+                .map(|m| bounds_or_zero(m.top, m.left, m.bottom, m.right)),
+            real_mask: layer
+                .additional_info
+                .real_mask
+                .as_ref()
+                .map(|m| bounds_or_zero(m.top, m.left, m.bottom, m.right)),
+        };
+    }
+
     let mut layer_data = get_layer_channels(temp_buffer, layer, background, options, psb);
     if let Some(mask) = &layer.additional_info.mask {
         get_mask_channels(temp_buffer, &mut layer_data, mask, options, psb, false);
@@ -1082,29 +1236,27 @@ fn get_mask_channels(
     let right = left + width as i32;
     let bottom = top + height as i32;
 
-    let (buffer, compression): (Vec<u8>, Compression) = if image_data.is_none() {
-        (Vec::new(), Compression::RleCompressed)
-    } else if options.compress == Some(true) {
-        (
-            write_data_zip_without_prediction(image_data.unwrap(), &[0]).unwrap_or_default(),
+    let (buffer, compression): (Vec<u8>, Compression) = match image_data {
+        None => (Vec::new(), Compression::RleCompressed),
+        Some(id) if options.compress == Some(true) => (
+            write_data_zip_without_prediction(id, &[0]).unwrap_or_default(),
             Compression::ZipWithoutPrediction,
-        )
-    } else {
-        (
-            write_data_rle(temp_buffer, image_data.unwrap(), &[0], psb).unwrap_or_default(),
+        ),
+        Some(id) => (
+            write_data_rle(temp_buffer, id, &[0], psb).unwrap_or_default(),
             Compression::RleCompressed,
-        )
+        ),
     };
 
     let length = 2 + buffer.len();
     layer_data.channels.push(ChannelData {
-        channel_id: if real_mask {
+        id: if real_mask {
             ChannelId::RealUserMask
         } else {
             ChannelId::UserMask
         },
         compression,
-        buffer: Some(buffer),
+        data: Some(buffer),
         length,
     });
 
@@ -1156,10 +1308,10 @@ fn get_layer_channels(
     // default empty channel set (Transparency, Color0..2), all length=2.
     let default_channels = || {
         vec![
-            ChannelData { channel_id: ChannelId::Transparency, compression: Compression::RawData, buffer: None, length: 2 },
-            ChannelData { channel_id: ChannelId::Color0, compression: Compression::RawData, buffer: None, length: 2 },
-            ChannelData { channel_id: ChannelId::Color1, compression: Compression::RawData, buffer: None, length: 2 },
-            ChannelData { channel_id: ChannelId::Color2, compression: Compression::RawData, buffer: None, length: 2 },
+            ChannelData { id: ChannelId::Transparency, compression: Compression::RawData, data: None, length: 2 },
+            ChannelData { id: ChannelId::Color0, compression: Compression::RawData, data: None, length: 2 },
+            ChannelData { id: ChannelId::Color1, compression: Compression::RawData, data: None, length: 2 },
+            ChannelData { id: ChannelId::Color2, compression: Compression::RawData, data: None, length: 2 },
         ]
     };
 
@@ -1252,7 +1404,7 @@ fn get_layer_channels(
                 )
             };
             let length = 2 + buffer.len();
-            ChannelData { channel_id, compression, buffer: Some(buffer), length }
+            ChannelData { id: channel_id, compression, data: Some(buffer), length }
         })
         .collect();
 
@@ -1577,17 +1729,34 @@ mod tests {
     use crate::psd::{BlendMode, Layer, Psd, ReadOptions};
     use crate::reader::read_psd;
 
-    fn read_fixture(rel: &str) -> Psd {
-        // Read with use_image_data so layers carry `image_data` (byte planes)
-        // for pixel comparison, instead of the (cloned) canvas.
-        let path = format!(
+    /// Path of the upstream read fixture `rel` (`test/read/<rel>/src.psd`).
+    ///
+    /// The fixture tree lives outside the crate directory and is therefore
+    /// absent from the published package, so callers must treat a missing file
+    /// as "skip", not "fail".
+    fn fixture_path(rel: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(format!(
             "{}/../../test/ag-psd/test/read/{}/src.psd",
             env!("CARGO_MANIFEST_DIR"),
             rel
-        );
-        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {}", path, e));
+        ))
+    }
+
+    /// Read fixture `rel`, or `None` when the fixture tree is not checked out.
+    ///
+    /// Reads with `use_image_data` so layers carry `image_data` (byte planes)
+    /// for pixel comparison instead of the (cloned) canvas. A fixture that
+    /// exists but fails to parse still panics — only absence is tolerated.
+    fn read_fixture(rel: &str) -> Option<Psd> {
+        let path = fixture_path(rel);
+        if !path.exists() {
+            eprintln!("fixture {} not present, skipping", path.display());
+            return None;
+        }
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
         let opts = ReadOptions { use_image_data: Some(true), ..Default::default() };
-        read_psd(&bytes, &opts).unwrap_or_else(|e| panic!("read_psd {}: {:?}", rel, e))
+        Some(read_psd(&bytes, &opts).unwrap_or_else(|e| panic!("read_psd {}: {:?}", rel, e)))
     }
 
     fn count_layers(layers: &[Layer]) -> usize {
@@ -1653,7 +1822,7 @@ mod tests {
 
     #[test]
     fn round_trip_layers_fixture() {
-        let orig = read_fixture("layers");
+        let Some(orig) = read_fixture("layers") else { return };
         let again = round_trip(&orig);
         assert_structural_eq(&orig, &again);
 
@@ -1670,7 +1839,7 @@ mod tests {
 
     #[test]
     fn round_trip_groups_fixture() {
-        let orig = read_fixture("groups");
+        let Some(orig) = read_fixture("groups") else { return };
         let again = round_trip(&orig);
         assert_structural_eq(&orig, &again);
 
@@ -1681,6 +1850,317 @@ mod tests {
             total_pixel_bytes(cb),
             "layer pixel byte totals survive round trip"
         );
+    }
+
+    /// Build an RGBA `PixelData` whose R/G/B carry `value(x, y)` and A is 255.
+    ///
+    /// Masks are single-channel in the file format; the reader materialises them
+    /// as grayscale RGBA (`setup_grayscale` + `reset_alpha`), so a mask built
+    /// this way compares byte-for-byte after a round trip.
+    fn gray_pattern(w: u32, h: u32, value: impl Fn(u32, u32) -> u8) -> PixelData {
+        let mut data = vec![0u8; (w as usize) * (h as usize) * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let v = value(x, y);
+                let i = ((y as usize) * (w as usize) + (x as usize)) * 4;
+                data[i] = v;
+                data[i + 1] = v;
+                data[i + 2] = v;
+                data[i + 3] = 255;
+            }
+        }
+        PixelData { width: w, height: h, data }
+    }
+
+    #[test]
+    fn round_trip_mask_larger_than_layer_bitmap() {
+        // Regression: the RLE scratch buffer used to be sized from layer
+        // bitmaps only (and only for layers that had one), so a mask bigger
+        // than both its layer and the composite silently produced truncated
+        // RLE data. Document 8x8, layer bitmap 2x2, mask 64x64.
+        let layer_bitmap = gray_pattern(2, 2, |x, y| (x * 40 + y * 80) as u8);
+        // A high-entropy pattern so RLE cannot compress the mask down into the
+        // (previously undersized) scratch buffer.
+        let mask_bitmap = gray_pattern(64, 64, |x, y| ((x * 7 + y * 13) % 251) as u8);
+
+        let mut layer = Layer::default();
+        layer.additional_info.name = Some("masked".to_string());
+        layer.top = Some(0.0);
+        layer.left = Some(0.0);
+        layer.bottom = Some(2.0);
+        layer.right = Some(2.0);
+        layer.image_data = Some(layer_bitmap);
+        layer.additional_info.mask = Some(LayerMaskData {
+            top: Some(0.0),
+            left: Some(0.0),
+            bottom: Some(64.0),
+            right: Some(64.0),
+            image_data: Some(mask_bitmap.clone()),
+            ..Default::default()
+        });
+
+        let psd = Psd {
+            width: 8.0,
+            height: 8.0,
+            color_mode: Some(ColorMode::Rgb),
+            bits_per_channel: Some(8.0),
+            children: Some(vec![layer]),
+            ..Default::default()
+        };
+
+        let again = round_trip(&psd);
+        let children = again.children.as_ref().expect("children");
+        assert_eq!(children.len(), 1, "one layer survives");
+        let mask = children[0]
+            .additional_info
+            .mask
+            .as_ref()
+            .expect("mask survives the round trip");
+        assert_eq!(mask.right.map(|v| v - mask.left.unwrap_or(0.0)), Some(64.0));
+        assert_eq!(mask.bottom.map(|v| v - mask.top.unwrap_or(0.0)), Some(64.0));
+        let got = mask.image_data.as_ref().expect("mask image data");
+        assert_eq!((got.width, got.height), (64, 64), "mask dimensions");
+        assert_eq!(got.data, mask_bitmap.data, "mask pixels survive round trip");
+    }
+
+    /// Round trip a document through `write_psd` with the PSB flag set.
+    fn round_trip_psb(psd: &Psd) -> Psd {
+        let bytes = write_psd(psd, &WriteOptions { psb: Some(true), ..Default::default() });
+        // The reader picks PSB up from the file header version, so no read-side flag.
+        let opts = ReadOptions { use_image_data: Some(true), ..Default::default() };
+        read_psd(&bytes, &opts).expect("re-read written psb")
+    }
+
+    #[test]
+    fn psb_layer_and_mask_channels_are_not_truncated() {
+        // Regression for the PSB RLE scratch shortfall: the per-row length table
+        // is 4 bytes per row in PSB but the estimate reserved 2, so a tall,
+        // narrow channel (where the table dominates the payload) overflowed the
+        // shared scratch buffer. `write_data_rle` drops out-of-bounds writes, so
+        // the result was a structurally valid PSB with the pixel payload missing.
+        //
+        // 1x256 layer + 1x256 mask need 256 * (4 + 2) = 1536 bytes each; the old
+        // estimate gave 256 * (2 + 2) = 1024. The document is kept at 1x1 so the
+        // composite estimate (10 bytes then, 24 now) cannot mask the shortfall.
+        let layer_bitmap = gray_pattern(1, 256, |_, y| (y % 251) as u8);
+        let mask_bitmap = gray_pattern(1, 256, |_, y| ((y * 7 + 3) % 251) as u8);
+
+        let mut layer = Layer::default();
+        layer.additional_info.name = Some("tall".to_string());
+        layer.top = Some(0.0);
+        layer.left = Some(0.0);
+        layer.bottom = Some(256.0);
+        layer.right = Some(1.0);
+        layer.image_data = Some(layer_bitmap.clone());
+        layer.additional_info.mask = Some(LayerMaskData {
+            top: Some(0.0),
+            left: Some(0.0),
+            bottom: Some(256.0),
+            right: Some(1.0),
+            image_data: Some(mask_bitmap.clone()),
+            ..Default::default()
+        });
+
+        let psd = Psd {
+            width: 1.0,
+            height: 1.0,
+            color_mode: Some(ColorMode::Rgb),
+            bits_per_channel: Some(8.0),
+            children: Some(vec![layer]),
+            ..Default::default()
+        };
+
+        let again = round_trip_psb(&psd);
+        let children = again.children.as_ref().expect("children");
+        assert_eq!(children.len(), 1, "one layer survives");
+
+        let got = children[0].image_data.as_ref().expect("layer image data");
+        assert_eq!((got.width, got.height), (1, 256), "layer dimensions");
+        // Only RGB survives: the layer has no alpha channel of its own here, and
+        // the writer emits one only when alpha is non-opaque, so compare colors.
+        for y in 0..256usize {
+            assert_eq!(
+                &got.data[y * 4..y * 4 + 3],
+                &layer_bitmap.data[y * 4..y * 4 + 3],
+                "layer pixel row {y} survives the psb round trip"
+            );
+        }
+
+        let mask = children[0]
+            .additional_info
+            .mask
+            .as_ref()
+            .expect("mask survives the round trip");
+        let got_mask = mask.image_data.as_ref().expect("mask image data");
+        assert_eq!((got_mask.width, got_mask.height), (1, 256), "mask dimensions");
+        assert_eq!(got_mask.data, mask_bitmap.data, "mask pixels survive the psb round trip");
+    }
+
+    #[test]
+    fn psb_composite_channels_are_not_truncated() {
+        // Same shortfall on the composite path, which encodes all channels in a
+        // single `write_data_rle` call: 3 channels of a 1x256 document need
+        // 3 * 256 * (4 + 2) = 4608 bytes, the old estimate gave 2560. No layers,
+        // so nothing else can size the scratch buffer up.
+        let composite = gray_pattern(1, 256, |_, y| ((y * 11 + 5) % 251) as u8);
+
+        let psd = Psd {
+            width: 1.0,
+            height: 256.0,
+            color_mode: Some(ColorMode::Rgb),
+            bits_per_channel: Some(8.0),
+            image_data: Some(composite.clone()),
+            ..Default::default()
+        };
+
+        let again = round_trip_psb(&psd);
+        let got = again.image_data.as_ref().expect("composite image data");
+        assert_eq!((got.width, got.height), (1, 256), "composite dimensions");
+        assert_eq!(got.data, composite.data, "composite pixels survive the psb round trip");
+    }
+
+    #[test]
+    fn largest_layer_size_measures_masks_and_bitmapless_layers() {
+        // A layer with no bitmap of its own but a 64x64 mask must still size the
+        // scratch buffer; previously such a layer was skipped entirely.
+        let mut layer = Layer::default();
+        layer.additional_info.mask = Some(LayerMaskData {
+            image_data: Some(gray_pattern(64, 64, |_, _| 0)),
+            ..Default::default()
+        });
+        // 2 * 64 + 2 * 64 * 64
+        assert_eq!(get_largest_layer_size(Some(&[layer.clone()]), false), 8320);
+        // PSB row lengths are 4 bytes wide: 4 * 64 + 2 * 64 * 64
+        assert_eq!(get_largest_layer_size(Some(&[layer]), true), 8448);
+
+        // real_mask counts as well, and the maximum wins over the layer bitmap.
+        let layer = Layer {
+            image_data: Some(gray_pattern(4, 4, |_, _| 0)),
+            additional_info: LayerAdditionalInfo {
+                real_mask: Some(LayerMaskData {
+                    image_data: Some(gray_pattern(32, 16, |_, _| 0)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // max(2*4 + 2*4*4, 2*16 + 2*32*16)
+        assert_eq!(get_largest_layer_size(Some(&[layer]), false), 1056);
+
+        // The recursion into groups still applies.
+        let child = Layer {
+            image_data: Some(gray_pattern(10, 10, |_, _| 0)),
+            ..Default::default()
+        };
+        let group = Layer {
+            children: Some(vec![child]),
+            ..Default::default()
+        };
+        assert_eq!(get_largest_layer_size(Some(&[group]), false), 220);
+
+        assert_eq!(get_largest_layer_size(None, false), 0);
+        assert_eq!(get_largest_layer_size(None, true), 0);
+    }
+
+    #[test]
+    fn rle_scratch_size_covers_the_psb_row_length_table() {
+        // A 1x1 PSB channel needs a 4-byte row length plus 2 bytes of encoded
+        // data. Upstream's `2 * height + 2 * width * height` yields 4 and
+        // truncates the channel; ours must not.
+        assert_eq!(rle_scratch_size(1, 1, 1, true), 6);
+        assert_eq!(rle_scratch_size(1, 1, 1, false), 4);
+
+        // A 1x1 three-channel PSB composite needs 3 * (4 + 2) = 18 bytes;
+        // upstream's `4 * 2 * w * h + 2 * h` yields 10.
+        assert_eq!(rle_scratch_size(1, 1, 3, true), 18);
+
+        // Saturating: an absurd bitmap must not wrap the size.
+        assert_eq!(rle_scratch_size(u32::MAX, u32::MAX, 4, true), usize::MAX);
+    }
+
+    #[test]
+    fn global_layer_mask_info_opacity_is_rounded() {
+        // 0.5 * 0xff == 127.5; truncation would emit 127 and break the round
+        // trip through the reader (which divides by 0xff again).
+        let mut w = create_writer_default();
+        let info = GlobalLayerMaskInfo {
+            overlay_color_space: 0.0,
+            color_space1: 0.0,
+            color_space2: 0.0,
+            color_space3: 0.0,
+            color_space4: 0.0,
+            opacity: 0.5,
+            kind: 0.0,
+        };
+        write_global_layer_mask_info(&mut w, Some(&info));
+        let buf = get_writer_buffer(&w);
+        // 4 bytes section length + 5 color-space u16 -> opacity u16 at [14..16].
+        assert_eq!(&buf[14..16], &[0x00, 128], "opacity is rounded, not truncated");
+    }
+
+    #[test]
+    fn raw_data_channels_are_written_verbatim() {
+        // Reading with `use_raw_data` leaves the undecoded channel payloads on
+        // the layers; the writer must emit them as-is instead of treating the
+        // layers as empty (which is what happened before the fast path existed).
+        let path = fixture_path("layers");
+        if !path.exists() {
+            eprintln!("fixture {} not present, skipping", path.display());
+            return;
+        }
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+        let raw = read_psd(
+            &bytes,
+            &ReadOptions { use_raw_data: Some(true), ..Default::default() },
+        )
+        .expect("read with use_raw_data");
+
+        let raw_children = raw.children.as_deref().expect("children");
+        assert!(
+            raw_children.iter().any(|l| l.raw_data.is_some()),
+            "fixture layers should carry raw_data"
+        );
+
+        let written = write_psd(&raw, &WriteOptions::default());
+        let again = read_psd(
+            &written,
+            &ReadOptions { use_image_data: Some(true), ..Default::default() },
+        )
+        .expect("re-read verbatim-written psd");
+
+        // The fixture was read above, so its absence was already handled.
+        let orig = read_fixture("layers").expect("fixture present");
+        assert_structural_eq(&orig, &again);
+
+        let ca = orig.children.as_deref().unwrap_or(&[]);
+        let cb = again.children.as_deref().unwrap_or(&[]);
+        assert!(total_pixel_bytes(ca) > 0, "fixture should have layer pixels");
+        assert_eq!(
+            total_pixel_bytes(ca),
+            total_pixel_bytes(cb),
+            "verbatim raw channels decode to the same pixel volume"
+        );
+
+        // Pixel-exact comparison: the verbatim path must not alter a single byte.
+        let mut pa = Vec::new();
+        let mut pb = Vec::new();
+        collect_pixels(ca, &mut pa);
+        collect_pixels(cb, &mut pb);
+        assert_eq!(pa, pb, "verbatim raw channels decode to identical pixels");
+    }
+
+    /// Depth-first collect of every layer's decoded pixel bytes.
+    fn collect_pixels(layers: &[Layer], out: &mut Vec<u8>) {
+        for l in layers {
+            if let Some(d) = &l.image_data {
+                out.extend_from_slice(&d.data);
+            }
+            if let Some(children) = &l.children {
+                collect_pixels(children, out);
+            }
+        }
     }
 
     #[test]

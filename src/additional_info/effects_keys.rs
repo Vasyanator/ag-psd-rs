@@ -38,6 +38,7 @@ use crate::descriptor::{
     write_version_and_descriptor, Descriptor, DescriptorValue, UnitDoubleValue,
 };
 use crate::effects_helpers::{read_effects, write_effects};
+use crate::helpers::enum_long_form_to_key;
 use crate::psd::{
     BevelDirection, BevelStyle, BevelTechnique, BlendMode, Color, ColorStop, EffectContour,
     EffectGradient, EffectNoiseGradient, EffectPattern, EffectSolidGradient, ExtraGradientInfo,
@@ -178,63 +179,102 @@ pub fn has_multi_effects(e: &LayerEffectsInfo) -> bool {
 //
 // createEnum.decode(val): берёт часть после '.', ищет в reverse-map, иначе def.
 // createEnum.encode(val): `${prefix}.${code}`. Здесь — типизированные пары.
+//
+// Table row = `(code, key, value)`, mirroring one entry of an upstream `createEnum`
+// map: `code` is the historical 4-character id stored in the file (the map VALUE),
+// `key` is the long-form id (the map KEY, the string union member in `psd.ts`) and
+// `value` is the Rust enum variant. The `key` column exists because Photoshop 2026
+// writes the long form instead of the code — see [`decode_enum`].
+type EnumTable<T> = [(&'static str, &'static str, T)];
 
 /// Общий декодер: `"prefix.code"` -> значение по таблице (или default).
-fn decode_enum<T: Copy>(val: &str, table: &[(&str, T)], default: T) -> T {
+///
+/// Lookup order mirrors upstream `createEnum().decode` after the Photoshop 2026 fix:
+/// the historical code first, then the long-form key verbatim (`BlnM.normal`), then the
+/// camelCase long form normalized to the key spelling (`BlnM.colorBurn` ->
+/// `color burn`). Unlike upstream this never fails: the Rust port has always fallen
+/// back to the default for an unknown code, and these tables carry no error channel.
+fn decode_enum<T: Copy>(val: &str, table: &EnumTable<T>, default: T) -> T {
     let code = val.split('.').nth(1).unwrap_or("");
     if code.is_empty() {
         return default;
     }
+    if let Some((_, _, v)) = table.iter().find(|(c, _, _)| *c == code) {
+        return *v;
+    }
+    if let Some((_, _, v)) = table.iter().find(|(_, k, _)| *k == code) {
+        return *v;
+    }
+    let spaced = enum_long_form_to_key(code);
     table
         .iter()
-        .find(|(c, _)| *c == code)
-        .map(|(_, v)| *v)
+        .find(|(_, k, _)| *k == spaced)
+        .map(|(_, _, v)| *v)
         .unwrap_or(default)
 }
 
 /// Общий энкодер: значение -> `"prefix.code"`.
-fn encode_enum<T: PartialEq>(prefix: &str, val: T, table: &[(&str, T)], default_code: &str) -> String {
+fn encode_enum<T: PartialEq>(
+    prefix: &str,
+    val: T,
+    table: &EnumTable<T>,
+    default_code: &str,
+) -> String {
     let code = table
         .iter()
-        .find(|(_, v)| *v == val)
-        .map(|(c, _)| *c)
+        .find(|(_, _, v)| *v == val)
+        .map(|(c, _, _)| *c)
         .unwrap_or(default_code);
     format!("{}.{}", prefix, code)
 }
 
 // --- BlnM (blend mode) -----------------------------------------------------
 
-const BLN_M: &[(&str, BlendMode)] = &[
-    ("Nrml", BlendMode::Normal),
-    ("Dslv", BlendMode::Dissolve),
-    ("Drkn", BlendMode::Darken),
-    ("Mltp", BlendMode::Multiply),
-    ("CBrn", BlendMode::ColorBurn),
-    ("linearBurn", BlendMode::LinearBurn),
-    ("darkerColor", BlendMode::DarkerColor),
-    ("Lghn", BlendMode::Lighten),
-    ("Scrn", BlendMode::Screen),
-    ("CDdg", BlendMode::ColorDodge),
-    ("linearDodge", BlendMode::LinearDodge),
-    ("lighterColor", BlendMode::LighterColor),
-    ("Ovrl", BlendMode::Overlay),
-    ("SftL", BlendMode::SoftLight),
-    ("HrdL", BlendMode::HardLight),
-    ("vividLight", BlendMode::VividLight),
-    ("linearLight", BlendMode::LinearLight),
-    ("pinLight", BlendMode::PinLight),
-    ("hardMix", BlendMode::HardMix),
-    ("Dfrn", BlendMode::Difference),
-    ("Xclu", BlendMode::Exclusion),
-    ("blendSubtraction", BlendMode::Subtract),
-    ("blendDivide", BlendMode::Divide),
-    ("H   ", BlendMode::Hue),
-    ("Strt", BlendMode::Saturation),
-    ("Clr ", BlendMode::Color),
-    ("Lmns", BlendMode::Luminosity),
+const BLN_M: &EnumTable<BlendMode> = &[
+    ("Nrml", "normal", BlendMode::Normal),
+    ("Dslv", "dissolve", BlendMode::Dissolve),
+    ("Drkn", "darken", BlendMode::Darken),
+    ("Mltp", "multiply", BlendMode::Multiply),
+    ("CBrn", "color burn", BlendMode::ColorBurn),
+    ("linearBurn", "linear burn", BlendMode::LinearBurn),
+    ("darkerColor", "darker color", BlendMode::DarkerColor),
+    ("Lghn", "lighten", BlendMode::Lighten),
+    ("Scrn", "screen", BlendMode::Screen),
+    ("CDdg", "color dodge", BlendMode::ColorDodge),
+    ("linearDodge", "linear dodge", BlendMode::LinearDodge),
+    ("lighterColor", "lighter color", BlendMode::LighterColor),
+    ("Ovrl", "overlay", BlendMode::Overlay),
+    ("SftL", "soft light", BlendMode::SoftLight),
+    ("HrdL", "hard light", BlendMode::HardLight),
+    ("vividLight", "vivid light", BlendMode::VividLight),
+    ("linearLight", "linear light", BlendMode::LinearLight),
+    ("pinLight", "pin light", BlendMode::PinLight),
+    ("hardMix", "hard mix", BlendMode::HardMix),
+    ("Dfrn", "difference", BlendMode::Difference),
+    ("Xclu", "exclusion", BlendMode::Exclusion),
+    ("blendSubtraction", "subtract", BlendMode::Subtract),
+    ("blendDivide", "divide", BlendMode::Divide),
+    ("H   ", "hue", BlendMode::Hue),
+    ("Strt", "saturation", BlendMode::Saturation),
+    ("Clr ", "color", BlendMode::Color),
+    ("Lmns", "luminosity", BlendMode::Luminosity),
+    // used in ABR
+    ("linearHeight", "linear height", BlendMode::LinearHeight),
+    ("Hght", "height", BlendMode::Height),
+    // 2nd version of subtract ?
+    ("Sbtr", "subtraction", BlendMode::Subtraction),
+    // added for compilation to work, not used in actual files: upstream needs a map
+    // entry for every member of the `BlendMode` union, and no real file carries this
+    // code. Kept identical so encode/decode round-trip the same way as upstream.
+    ("????", "pass through", BlendMode::PassThrough),
 ];
 
-fn bln_m_decode(val: &str) -> BlendMode {
+/// Decodes a `BlnM` descriptor enum value (`"BlnM.Nrml"`, `"BlnM.colorBurn"`) into a
+/// [`BlendMode`], falling back to `normal` for anything unrecognized.
+///
+/// `pub(crate)` because `abr.rs` decodes the very same descriptor enum and must not
+/// carry a second copy of the table.
+pub(crate) fn bln_m_decode(val: &str) -> BlendMode {
     decode_enum(val, BLN_M, BlendMode::Normal)
 }
 fn bln_m_encode(val: BlendMode) -> String {
@@ -243,10 +283,10 @@ fn bln_m_encode(val: BlendMode) -> String {
 
 // --- FStl (stroke position) ------------------------------------------------
 
-const F_STL: &[(&str, StrokePosition)] = &[
-    ("OutF", StrokePosition::Outside),
-    ("CtrF", StrokePosition::Center),
-    ("InsF", StrokePosition::Inside),
+const F_STL: &EnumTable<StrokePosition> = &[
+    ("OutF", "outside", StrokePosition::Outside),
+    ("CtrF", "center", StrokePosition::Center),
+    ("InsF", "inside", StrokePosition::Inside),
 ];
 
 fn f_stl_decode(val: &str) -> StrokePosition {
@@ -258,10 +298,10 @@ fn f_stl_encode(val: StrokePosition) -> String {
 
 // --- FrFl (stroke fill type) -----------------------------------------------
 
-const FR_FL: &[(&str, StrokeFillType)] = &[
-    ("SClr", StrokeFillType::Color),
-    ("GrFl", StrokeFillType::Gradient),
-    ("Ptrn", StrokeFillType::Pattern),
+const FR_FL: &EnumTable<StrokeFillType> = &[
+    ("SClr", "color", StrokeFillType::Color),
+    ("GrFl", "gradient", StrokeFillType::Gradient),
+    ("Ptrn", "pattern", StrokeFillType::Pattern),
 ];
 
 fn fr_fl_decode(val: &str) -> StrokeFillType {
@@ -273,12 +313,12 @@ fn fr_fl_encode(val: StrokeFillType) -> String {
 
 // --- BESl (bevel style) ----------------------------------------------------
 
-const BE_SL: &[(&str, BevelStyle)] = &[
-    ("InrB", BevelStyle::InnerBevel),
-    ("OtrB", BevelStyle::OuterBevel),
-    ("Embs", BevelStyle::Emboss),
-    ("PlEb", BevelStyle::PillowEmboss),
-    ("strokeEmboss", BevelStyle::StrokeEmboss),
+const BE_SL: &EnumTable<BevelStyle> = &[
+    ("InrB", "inner bevel", BevelStyle::InnerBevel),
+    ("OtrB", "outer bevel", BevelStyle::OuterBevel),
+    ("Embs", "emboss", BevelStyle::Emboss),
+    ("PlEb", "pillow emboss", BevelStyle::PillowEmboss),
+    ("strokeEmboss", "stroke emboss", BevelStyle::StrokeEmboss),
 ];
 
 fn be_sl_decode(val: &str) -> BevelStyle {
@@ -290,10 +330,10 @@ fn be_sl_encode(val: BevelStyle) -> String {
 
 // --- bvlT (bevel technique) ------------------------------------------------
 
-const BVL_T: &[(&str, BevelTechnique)] = &[
-    ("SfBL", BevelTechnique::Smooth),
-    ("PrBL", BevelTechnique::ChiselHard),
-    ("Slmt", BevelTechnique::ChiselSoft),
+const BVL_T: &EnumTable<BevelTechnique> = &[
+    ("SfBL", "smooth", BevelTechnique::Smooth),
+    ("PrBL", "chisel hard", BevelTechnique::ChiselHard),
+    ("Slmt", "chisel soft", BevelTechnique::ChiselSoft),
 ];
 
 fn bvl_t_decode(val: &str) -> BevelTechnique {
@@ -305,8 +345,10 @@ fn bvl_t_encode(val: BevelTechnique) -> String {
 
 // --- BESs (bevel direction) ------------------------------------------------
 
-const BE_SS: &[(&str, BevelDirection)] =
-    &[("In  ", BevelDirection::Up), ("Out ", BevelDirection::Down)];
+const BE_SS: &EnumTable<BevelDirection> = &[
+    ("In  ", "up", BevelDirection::Up),
+    ("Out ", "down", BevelDirection::Down),
+];
 
 fn be_ss_decode(val: &str) -> BevelDirection {
     decode_enum(val, BE_SS, BevelDirection::Up)
@@ -317,8 +359,10 @@ fn be_ss_encode(val: BevelDirection) -> String {
 
 // --- BETE (glow technique) -------------------------------------------------
 
-const BE_TE: &[(&str, GlowTechnique)] =
-    &[("SfBL", GlowTechnique::Softer), ("PrBL", GlowTechnique::Precise)];
+const BE_TE: &EnumTable<GlowTechnique> = &[
+    ("SfBL", "softer", GlowTechnique::Softer),
+    ("PrBL", "precise", GlowTechnique::Precise),
+];
 
 fn be_te_decode(val: &str) -> GlowTechnique {
     decode_enum(val, BE_TE, GlowTechnique::Softer)
@@ -329,7 +373,10 @@ fn be_te_encode(val: GlowTechnique) -> String {
 
 // --- IGSr (glow source) ----------------------------------------------------
 
-const IG_SR: &[(&str, GlowSource)] = &[("SrcE", GlowSource::Edge), ("SrcC", GlowSource::Center)];
+const IG_SR: &EnumTable<GlowSource> = &[
+    ("SrcE", "edge", GlowSource::Edge),
+    ("SrcC", "center", GlowSource::Center),
+];
 
 fn ig_sr_decode(val: &str) -> GlowSource {
     decode_enum(val, IG_SR, GlowSource::Edge)
@@ -340,12 +387,12 @@ fn ig_sr_encode(val: GlowSource) -> String {
 
 // --- GrdT (gradient style) -------------------------------------------------
 
-const GRD_T: &[(&str, GradientStyle)] = &[
-    ("Lnr ", GradientStyle::Linear),
-    ("Rdl ", GradientStyle::Radial),
-    ("Angl", GradientStyle::Angle),
-    ("Rflc", GradientStyle::Reflected),
-    ("Dmnd", GradientStyle::Diamond),
+const GRD_T: &EnumTable<GradientStyle> = &[
+    ("Lnr ", "linear", GradientStyle::Linear),
+    ("Rdl ", "radial", GradientStyle::Radial),
+    ("Angl", "angle", GradientStyle::Angle),
+    ("Rflc", "reflected", GradientStyle::Reflected),
+    ("Dmnd", "diamond", GradientStyle::Diamond),
 ];
 
 fn grd_t_decode(val: &str) -> GradientStyle {
@@ -357,11 +404,11 @@ fn grd_t_encode(val: GradientStyle) -> String {
 
 // --- gradientInterpolationMethodType ---------------------------------------
 
-const GS99: &[(&str, InterpolationMethod)] = &[
-    ("Perc", InterpolationMethod::Perceptual),
-    ("Lnr ", InterpolationMethod::Linear),
-    ("Gcls", InterpolationMethod::Classic),
-    ("Smoo", InterpolationMethod::Smooth),
+const GS99: &EnumTable<InterpolationMethod> = &[
+    ("Perc", "perceptual", InterpolationMethod::Perceptual),
+    ("Lnr ", "linear", InterpolationMethod::Linear),
+    ("Gcls", "classic", InterpolationMethod::Classic),
+    ("Smoo", "smooth", InterpolationMethod::Smooth),
 ];
 
 fn gs99_decode(val: &str) -> InterpolationMethod {
@@ -373,10 +420,11 @@ fn gs99_encode(val: InterpolationMethod) -> String {
 
 // --- ClrS (gradient color model) -------------------------------------------
 
-const CLR_S: &[(&str, GradientColorModel)] = &[
-    ("RGBC", GradientColorModel::Rgb),
-    ("HSBl", GradientColorModel::Hsb),
-    ("LbCl", GradientColorModel::Lab),
+const CLR_S: &EnumTable<GradientColorModel> = &[
+    ("RGBC", "rgb", GradientColorModel::Rgb),
+    ("HSBl", "hsb", GradientColorModel::Hsb),
+    ("LbCl", "lab", GradientColorModel::Lab),
+    ("HSLC", "hsl", GradientColorModel::Hsl),
 ];
 
 fn clr_s_decode(val: &str) -> GradientColorModel {
@@ -686,11 +734,13 @@ fn point_percent(d: &Descriptor) -> ReadResult<PointF> {
 // ===========================================================================
 
 fn parse_shadow(d: &Descriptor) -> ReadResult<LayerEffectShadow> {
-    let mut s = LayerEffectShadow::default();
-    s.enabled = opt_bool(d, "enab");
-    s.use_global_light = opt_bool(d, "uglg");
-    s.antialiased = opt_bool(d, "AntA");
-    s.layer_conceals = opt_bool(d, "layerConceals");
+    let mut s = LayerEffectShadow {
+        enabled: opt_bool(d, "enab"),
+        use_global_light: opt_bool(d, "uglg"),
+        antialiased: opt_bool(d, "AntA"),
+        layer_conceals: opt_bool(d, "layerConceals"),
+        ..LayerEffectShadow::default()
+    };
     if let Some(v) = d.get("present") {
         s.present = bool_of(v);
     }
@@ -725,9 +775,11 @@ fn parse_shadow(d: &Descriptor) -> ReadResult<LayerEffectShadow> {
 }
 
 fn parse_outer_glow(d: &Descriptor) -> ReadResult<LayerEffectsOuterGlow> {
-    let mut s = LayerEffectsOuterGlow::default();
-    s.enabled = opt_bool(d, "enab");
-    s.antialiased = opt_bool(d, "AntA");
+    let mut s = LayerEffectsOuterGlow {
+        enabled: opt_bool(d, "enab"),
+        antialiased: opt_bool(d, "AntA"),
+        ..LayerEffectsOuterGlow::default()
+    };
     if let Some(v) = d.get("present") {
         s.present = bool_of(v);
     }
@@ -768,9 +820,11 @@ fn parse_outer_glow(d: &Descriptor) -> ReadResult<LayerEffectsOuterGlow> {
 }
 
 fn parse_inner_glow(d: &Descriptor) -> ReadResult<LayerEffectInnerGlow> {
-    let mut s = LayerEffectInnerGlow::default();
-    s.enabled = opt_bool(d, "enab");
-    s.antialiased = opt_bool(d, "AntA");
+    let mut s = LayerEffectInnerGlow {
+        enabled: opt_bool(d, "enab"),
+        antialiased: opt_bool(d, "AntA"),
+        ..LayerEffectInnerGlow::default()
+    };
     if let Some(v) = d.get("present") {
         s.present = bool_of(v);
     }
@@ -814,12 +868,14 @@ fn parse_inner_glow(d: &Descriptor) -> ReadResult<LayerEffectInnerGlow> {
 }
 
 fn parse_bevel(d: &Descriptor) -> ReadResult<LayerEffectBevel> {
-    let mut s = LayerEffectBevel::default();
-    s.enabled = opt_bool(d, "enab");
-    s.use_global_light = opt_bool(d, "uglg");
-    s.antialias_gloss = opt_bool(d, "antialiasGloss");
-    s.use_texture = opt_bool(d, "useTexture");
-    s.use_shape = opt_bool(d, "useShape");
+    let mut s = LayerEffectBevel {
+        enabled: opt_bool(d, "enab"),
+        use_global_light: opt_bool(d, "uglg"),
+        antialias_gloss: opt_bool(d, "antialiasGloss"),
+        use_texture: opt_bool(d, "useTexture"),
+        use_shape: opt_bool(d, "useShape"),
+        ..LayerEffectBevel::default()
+    };
     if let Some(v) = d.get("present") {
         s.present = bool_of(v);
     }
@@ -875,8 +931,8 @@ fn parse_bevel(d: &Descriptor) -> ReadResult<LayerEffectBevel> {
 }
 
 fn parse_solid_fill(d: &Descriptor) -> ReadResult<LayerEffectSolidFill> {
-    let mut s = LayerEffectSolidFill::default();
-    s.enabled = opt_bool(d, "enab");
+    let mut s =
+        LayerEffectSolidFill { enabled: opt_bool(d, "enab"), ..LayerEffectSolidFill::default() };
     if let Some(v) = d.get("present") {
         s.present = bool_of(v);
     }
@@ -896,10 +952,12 @@ fn parse_solid_fill(d: &Descriptor) -> ReadResult<LayerEffectSolidFill> {
 }
 
 fn parse_satin(d: &Descriptor) -> ReadResult<LayerEffectSatin> {
-    let mut s = LayerEffectSatin::default();
-    s.enabled = opt_bool(d, "enab");
-    s.antialiased = opt_bool(d, "AntA");
-    s.invert = opt_bool(d, "Invr");
+    let mut s = LayerEffectSatin {
+        enabled: opt_bool(d, "enab"),
+        antialiased: opt_bool(d, "AntA"),
+        invert: opt_bool(d, "Invr"),
+        ..LayerEffectSatin::default()
+    };
     if let Some(v) = d.get("present") {
         s.present = bool_of(v);
     }
@@ -931,11 +989,13 @@ fn parse_satin(d: &Descriptor) -> ReadResult<LayerEffectSatin> {
 }
 
 fn parse_gradient_overlay(d: &Descriptor) -> ReadResult<LayerEffectGradientOverlay> {
-    let mut s = LayerEffectGradientOverlay::default();
-    s.enabled = opt_bool(d, "enab");
-    s.dither = opt_bool(d, "Dthr");
-    s.reverse = opt_bool(d, "Rvrs");
-    s.align = opt_bool(d, "Algn");
+    let mut s = LayerEffectGradientOverlay {
+        enabled: opt_bool(d, "enab"),
+        dither: opt_bool(d, "Dthr"),
+        reverse: opt_bool(d, "Rvrs"),
+        align: opt_bool(d, "Algn"),
+        ..LayerEffectGradientOverlay::default()
+    };
     if let Some(v) = d.get("present") {
         s.present = bool_of(v);
     }
@@ -971,9 +1031,11 @@ fn parse_gradient_overlay(d: &Descriptor) -> ReadResult<LayerEffectGradientOverl
 }
 
 fn parse_pattern_overlay(d: &Descriptor) -> ReadResult<LayerEffectPatternOverlay> {
-    let mut s = LayerEffectPatternOverlay::default();
-    s.enabled = opt_bool(d, "enab");
-    s.align = opt_bool(d, "Algn");
+    let mut s = LayerEffectPatternOverlay {
+        enabled: opt_bool(d, "enab"),
+        align: opt_bool(d, "Algn"),
+        ..LayerEffectPatternOverlay::default()
+    };
     if let Some(v) = d.get("present") {
         s.present = bool_of(v);
     }
@@ -1000,20 +1062,22 @@ fn parse_pattern_overlay(d: &Descriptor) -> ReadResult<LayerEffectPatternOverlay
 
 /// Зеркало parseFxObject (stroke / FrFX).
 fn parse_fx_object(d: &Descriptor) -> ReadResult<LayerEffectStroke> {
-    let mut s = LayerEffectStroke::default();
-    s.enabled = Some(get_bool(d, "enab"));
-    s.position = Some(match d.get("Styl") {
-        Some(DescriptorValue::Enum(v)) => f_stl_decode(v),
-        _ => StrokePosition::Outside,
-    });
-    s.fill_type = Some(match d.get("PntT") {
-        Some(DescriptorValue::Enum(v)) => fr_fl_decode(v),
-        _ => StrokeFillType::Color,
-    });
-    s.blend_mode = Some(match d.get("Md  ") {
-        Some(DescriptorValue::Enum(v)) => bln_m_decode(v),
-        _ => BlendMode::Normal,
-    });
+    let mut s = LayerEffectStroke {
+        enabled: Some(get_bool(d, "enab")),
+        position: Some(match d.get("Styl") {
+            Some(DescriptorValue::Enum(v)) => f_stl_decode(v),
+            _ => StrokePosition::Outside,
+        }),
+        fill_type: Some(match d.get("PntT") {
+            Some(DescriptorValue::Enum(v)) => fr_fl_decode(v),
+            _ => StrokeFillType::Color,
+        }),
+        blend_mode: Some(match d.get("Md  ") {
+            Some(DescriptorValue::Enum(v)) => bln_m_decode(v),
+            _ => BlendMode::Normal,
+        }),
+        ..LayerEffectStroke::default()
+    };
     if let Some(v) = d.get("Opct") {
         s.opacity = Some(parse_percent(v)?);
     }
@@ -1565,6 +1629,9 @@ const BLEND_MODE_STR: &[(&str, BlendMode)] = &[
     ("saturation", BlendMode::Saturation),
     ("color", BlendMode::Color),
     ("luminosity", BlendMode::Luminosity),
+    ("linear height", BlendMode::LinearHeight),
+    ("height", BlendMode::Height),
+    ("subtraction", BlendMode::Subtraction),
 ];
 
 // ===========================================================================
@@ -1919,21 +1986,23 @@ mod tests {
     #[test]
     fn lr_fx_legacy_round_trip() {
         // lrFX delegates to effects_helpers::{write_effects, read_effects}.
-        let mut info = LayerAdditionalInfo::default();
-        info.effects = Some(LayerEffectsInfo {
-            drop_shadow: Some(vec![LayerEffectShadow {
-                enabled: Some(true),
-                use_global_light: Some(true),
-                size: Some(px(5.0)),
-                distance: Some(px(3.0)),
-                angle: Some(90.0),
-                color: Some(rgb(10.0, 20.0, 30.0)),
-                blend_mode: Some(BlendMode::Multiply),
-                opacity: Some(0.5),
-                ..LayerEffectShadow::default()
-            }]),
-            ..LayerEffectsInfo::default()
-        });
+        let info = LayerAdditionalInfo {
+            effects: Some(LayerEffectsInfo {
+                drop_shadow: Some(vec![LayerEffectShadow {
+                    enabled: Some(true),
+                    use_global_light: Some(true),
+                    size: Some(px(5.0)),
+                    distance: Some(px(3.0)),
+                    angle: Some(90.0),
+                    color: Some(rgb(10.0, 20.0, 30.0)),
+                    blend_mode: Some(BlendMode::Multiply),
+                    opacity: Some(0.5),
+                    ..LayerEffectShadow::default()
+                }]),
+                ..LayerEffectsInfo::default()
+            }),
+            ..LayerAdditionalInfo::default()
+        };
 
         // has(lrFX) should be true.
         assert_eq!(has("lrFX", &info), Some(true));
@@ -1962,8 +2031,10 @@ mod tests {
 
     #[test]
     fn has_multi_effects_detection() {
-        let mut e = LayerEffectsInfo::default();
-        e.drop_shadow = Some(vec![LayerEffectShadow::default()]);
+        let mut e = LayerEffectsInfo {
+            drop_shadow: Some(vec![LayerEffectShadow::default()]),
+            ..LayerEffectsInfo::default()
+        };
         assert!(!has_multi_effects(&e));
         e.drop_shadow = Some(vec![LayerEffectShadow::default(), LayerEffectShadow::default()]);
         assert!(has_multi_effects(&e));
@@ -1977,5 +2048,52 @@ mod tests {
 
     fn default_read_options() -> crate::psd::ReadOptions {
         crate::psd::ReadOptions::default()
+    }
+
+    // -- Photoshop 2026 long-form descriptor enum values ----------------------------
+
+    #[test]
+    fn bln_m_decodes_historical_codes() {
+        assert_eq!(bln_m_decode("BlnM.Nrml"), BlendMode::Normal);
+        assert_eq!(bln_m_decode("BlnM.CBrn"), BlendMode::ColorBurn);
+        assert_eq!(bln_m_decode("BlnM.linearBurn"), BlendMode::LinearBurn);
+    }
+
+    #[test]
+    fn bln_m_decodes_photoshop_2026_long_form() {
+        // Single-word: the map key verbatim. Multi-word: camelCase -> spaced key.
+        assert_eq!(bln_m_decode("BlnM.normal"), BlendMode::Normal);
+        assert_eq!(bln_m_decode("BlnM.colorBurn"), BlendMode::ColorBurn);
+        assert_eq!(bln_m_decode("BlnM.darkerColor"), BlendMode::DarkerColor);
+        assert_eq!(bln_m_decode("BlnM.hardMix"), BlendMode::HardMix);
+    }
+
+    #[test]
+    fn bln_m_falls_back_to_normal_for_unknown_values() {
+        assert_eq!(bln_m_decode("BlnM.wibbleWobble"), BlendMode::Normal);
+        assert_eq!(bln_m_decode("BlnM"), BlendMode::Normal);
+    }
+
+    #[test]
+    fn bln_m_round_trips_the_modes_added_in_v31() {
+        for mode in [
+            BlendMode::LinearHeight,
+            BlendMode::Height,
+            BlendMode::Subtraction,
+            BlendMode::PassThrough,
+        ] {
+            let encoded = bln_m_encode(mode);
+            assert_eq!(bln_m_decode(&encoded), mode, "round trip failed for {encoded}");
+        }
+        // The dummy code upstream added so every union member has a map entry.
+        assert_eq!(bln_m_encode(BlendMode::PassThrough), "BlnM.????");
+    }
+
+    #[test]
+    fn clr_s_supports_hsl() {
+        assert_eq!(clr_s_encode(GradientColorModel::Hsl), "ClrS.HSLC");
+        assert_eq!(clr_s_decode("ClrS.HSLC"), GradientColorModel::Hsl);
+        assert_eq!(clr_s_decode("ClrS.hsl"), GradientColorModel::Hsl);
+        assert_eq!(clr_s_decode("ClrS.RGBC"), GradientColorModel::Rgb);
     }
 }
