@@ -7,3 +7,6 @@ Cargo.lock
 # Editor / OS junk
 *.swp
 .DS_Store
+
+# Optional upstream PSD fixture corpus; keep locally, never commit it.
+/test/ag-psd/

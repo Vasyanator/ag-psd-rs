@@ -398,7 +398,13 @@ mod json {
 
 /// Корень эталонных фикстур (read-only). `crates/ag-psd` -> корень репо -> test.
 fn fixtures_root() -> PathBuf {
-    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../test/ag-psd/test"))
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let local = manifest_dir.join("test").join("ag-psd").join("test");
+    if local.is_dir() {
+        local
+    } else {
+        manifest_dir.join("../../test/ag-psd/test")
+    }
 }
 
 /// Рекурсивно собрать все `src.psd`. Только std::fs, без внешних крейтов.

@@ -3359,11 +3359,22 @@ mod tests {
     /// absent from the published package, so callers must treat a missing file
     /// as "skip", not "fail".
     fn fixture_path(rel: &str) -> std::path::PathBuf {
-        std::path::PathBuf::from(format!(
-            "{}/../../test/ag-psd/test/read/{}/src.psd",
-            env!("CARGO_MANIFEST_DIR"),
-            rel
-        ))
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let local = manifest_dir
+            .join("test")
+            .join("ag-psd")
+            .join("test")
+            .join("read")
+            .join(rel)
+            .join("src.psd");
+        if local.is_file() {
+            local
+        } else {
+            manifest_dir
+                .join("../../test/ag-psd/test/read")
+                .join(rel)
+                .join("src.psd")
+        }
     }
 
     /// Bytes of the upstream read fixture `rel`, or `None` when the fixture
