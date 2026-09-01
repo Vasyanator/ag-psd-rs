@@ -545,12 +545,13 @@ most users will interact with text through `LayerAdditionalInfo.text` instead.
 
 ## Limitations & gotchas
 
-- **Writer = 8-bit RGB only** (faithful to upstream). 16/32-bit, grayscale,
-  indexed, bitmap, duotone documents read but don't re-emit in original form.
+- **Writer supports 8/16/32-bit RGB PSD/PSB.** `PixelData` remains RGBA8;
+  synthesized high-bit channels use integer expansion for 16-bit and normalized
+  IEEE-754 floats for 32-bit. Grayscale, indexed, bitmap and duotone documents
+  read but don't re-emit in their original mode.
 - **CMYK read is rejected** at the header.
 - Some advanced subtrees are partial/stubbed: vector gradient/pattern content
-  (`Grad`/`Ptrn`), `vstk` stroke units, `vogk`/`pths` paths, `Lr16`/`Lr32`
-  nested layers, `Psd.linked_files` storage, smart-object `SoLd` filter-FX,
+  (`Grad`/`Ptrn`), `vstk` stroke units, `vogk`/`pths` paths, `Psd.linked_files` storage, smart-object `SoLd` filter-FX,
   `shmd` timeline/comps, thumbnail generation, link groups, `Txt2` text paths.
   These weren't needed for the original use case; open an issue if you need them.
 - Opacity is **0.0–1.0**, not 0–255.

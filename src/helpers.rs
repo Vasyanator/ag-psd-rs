@@ -453,6 +453,38 @@ pub fn write_data_raw(data: &PixelData, offset: usize, width: usize, height: usi
     Some(array)
 }
 
+/// Expands RGBA8 channel samples into the byte representation required by an
+/// RGB PSD/PSB channel at the requested bit depth.
+pub fn expand_channel_samples(samples: &[u8], bit_depth: u32) -> Option<Vec<u8>> {
+    match bit_depth {
+        8 => Some(samples.to_vec()),
+        16 => Some(
+            samples
+                .iter()
+                .flat_map(|&sample| (u16::from(sample) * 257).to_be_bytes())
+                .collect(),
+        ),
+        32 => Some(
+            samples
+                .iter()
+                .flat_map(|&sample| (f32::from(sample) / 255.0).to_be_bytes())
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// Extracts one RGBA8 channel and expands it to a raw PSD channel payload.
+pub fn write_data_raw_bit_depth(
+    data: &PixelData,
+    offset: usize,
+    width: usize,
+    height: usize,
+    bit_depth: u32,
+) -> Option<Vec<u8>> {
+    expand_channel_samples(&write_data_raw(data, offset, width, height)?, bit_depth)
+}
+
 /// upstream `writeDataRLE(buffer, { data, width, height }, offsets, large)`.
 /// Сжимает каналы по PackBits, как в оригинале (включая раскладку length-таблицы
 /// в начале буфера). Возвращает срез использованной части буфера.
@@ -613,6 +645,100 @@ pub fn write_data_rle(
     Some(buffer[..end].to_vec())
 }
 
+/// Writes channel data using PackBits after expanding RGBA8 samples to the
+/// requested PSD bit depth. The row-length table stores encoded byte lengths.
+pub fn write_data_rle_bit_depth(
+    buffer: &mut [u8],
+    data_pixels: &PixelData,
+    offsets: &[usize],
+    large: bool,
+    bit_depth: u32,
+) -> Option<Vec<u8>> {
+    if bit_depth == 8 {
+        return write_data_rle(buffer, data_pixels, offsets, large);
+    }
+    let width = data_pixels.width as usize;
+    let height = data_pixels.height as usize;
+    if width == 0 || height == 0 || offsets.is_empty() {
+        return None;
+    }
+    let bytes_per_sample = match bit_depth {
+        16 => 2,
+        32 => 4,
+        _ => return None,
+    };
+    let entry_size = if large { 4 } else { 2 };
+    let table_size = offsets.len() * height * entry_size;
+    let mut output = vec![0u8; table_size];
+    let mut table_offset = 0usize;
+    for &offset in offsets {
+        let mut channel = Vec::with_capacity(width * height);
+        for pixel in 0..width * height {
+            channel.push(data_pixels.data[pixel * 4 + offset]);
+        }
+        let expanded = expand_channel_samples(&channel, bit_depth)?;
+        for row in 0..height {
+            let row_start = row * width * bytes_per_sample;
+            let row_end = row_start + width * bytes_per_sample;
+            let encoded = packbits_encode(&expanded[row_start..row_end]);
+            let length = encoded.len();
+            if large {
+                if table_offset + 4 <= output.len() {
+                    output[table_offset..table_offset + 4]
+                        .copy_from_slice(&(length as u32).to_be_bytes());
+                }
+                table_offset += 4;
+            } else {
+                if table_offset + 2 <= output.len() {
+                    output[table_offset..table_offset + 2]
+                        .copy_from_slice(&(length as u16).to_be_bytes());
+                }
+                table_offset += 2;
+            }
+            output.extend_from_slice(&encoded);
+        }
+    }
+    let copy_len = output.len().min(buffer.len());
+    buffer[..copy_len].copy_from_slice(&output[..copy_len]);
+    Some(output[..copy_len].to_vec())
+}
+
+fn packbits_encode(row: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(row.len() + row.len() / 128 + 1);
+    let mut i = 0usize;
+    while i < row.len() {
+        let mut run = 1usize;
+        while i + run < row.len() && row[i + run] == row[i] && run < 128 {
+            run += 1;
+        }
+        if run >= 3 {
+            encoded.push((1i16 - run as i16) as u8);
+            encoded.push(row[i]);
+            i += run;
+            continue;
+        }
+        let literal_start = i;
+        i += run;
+        while i < row.len() && i - literal_start < 128 {
+            let mut next_run = 1usize;
+            while i + next_run < row.len()
+                && row[i + next_run] == row[i]
+                && next_run < 128
+            {
+                next_run += 1;
+            }
+            if next_run >= 3 {
+                break;
+            }
+            i += next_run;
+        }
+        let literal_len = i - literal_start;
+        encoded.push((literal_len - 1) as u8);
+        encoded.extend_from_slice(&row[literal_start..i]);
+    }
+    encoded
+}
+
 /// upstream `writeDataZipWithoutPrediction({ data, width, height }, offsets)`.
 /// Извлекает каждый канал и сжимает zlib/deflate, конкатенируя результаты.
 pub fn write_data_zip_without_prediction(data_pixels: &PixelData, offsets: &[usize]) -> Option<Vec<u8>> {
@@ -644,6 +770,35 @@ pub fn write_data_zip_without_prediction(data_pixels: &PixelData, offsets: &[usi
         // upstream возвращает buffers[0] (undefined при пустом списке).
         None
     }
+}
+
+/// Encodes channels with ZIP (zlib-wrapped deflate) after expanding RGBA8
+/// samples to a PSD channel bit depth.
+pub fn write_data_zip_without_prediction_bit_depth(
+    data_pixels: &PixelData,
+    offsets: &[usize],
+    bit_depth: u32,
+) -> Option<Vec<u8>> {
+    if bit_depth == 8 {
+        return write_data_zip_without_prediction(data_pixels, offsets);
+    }
+    let size = (data_pixels.width as usize) * (data_pixels.height as usize);
+    if size == 0 || offsets.is_empty() {
+        return None;
+    }
+    let mut buffers = Vec::with_capacity(offsets.len());
+    for &offset in offsets {
+        let samples = (0..size)
+            .map(|pixel| data_pixels.data[pixel * 4 + offset])
+            .collect::<Vec<_>>();
+        buffers.push(deflate_sync(&expand_channel_samples(&samples, bit_depth)?));
+    }
+    let total_length = buffers.iter().map(Vec::len).sum();
+    let mut output = Vec::with_capacity(total_length);
+    for buffer in buffers {
+        output.extend_from_slice(&buffer);
+    }
+    Some(output)
 }
 
 /// Эквивалент `deflate` из `pako` (zlib-обёрнутый deflate).
@@ -842,6 +997,32 @@ mod tests {
         assert_eq!(write_data_raw(&pd, 0, 2, 1), Some(vec![10, 50])); // red
         assert_eq!(write_data_raw(&pd, 3, 2, 1), Some(vec![40, 80])); // alpha
         assert_eq!(write_data_raw(&pd, 0, 0, 1), None);
+    }
+
+    #[test]
+    fn expands_rgba8_samples_for_high_bit_depths() {
+        assert_eq!(
+            expand_channel_samples(&[0, 1, 127, 255], 16),
+            Some(vec![0, 0, 1, 1, 127, 127, 255, 255])
+        );
+        let expanded = expand_channel_samples(&[0, 1, 127, 255], 32).unwrap();
+        let values = expanded
+            .chunks_exact(4)
+            .map(|bytes| f32::from_be_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![0.0, 1.0 / 255.0, 127.0 / 255.0, 1.0]);
+        assert_eq!(expand_channel_samples(&[1], 12), None);
+        let pd = PixelData {
+            width: 2,
+            height: 1,
+            data: vec![1, 2, 3, 4, 255, 6, 7, 8],
+        };
+        assert_eq!(write_data_raw_bit_depth(&pd, 0, 2, 1, 16), Some(vec![1, 1, 255, 255]));
+        let compressed = write_data_zip_without_prediction_bit_depth(&pd, &[0], 32).unwrap();
+        let mut decoder = flate2::read::DeflateDecoder::new(&compressed[..]);
+        let mut decoded = Vec::new();
+        std::io::Read::read_to_end(&mut decoder, &mut decoded).unwrap();
+        assert_eq!(decoded, [1.0f32 / 255.0, 1.0].into_iter().flat_map(f32::to_be_bytes).collect::<Vec<_>>());
     }
 
     #[test]

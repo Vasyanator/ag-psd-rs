@@ -2169,26 +2169,37 @@ pub fn read_data_zip(
             // 32-bit float, optionally byte-predicted across width*4 bytes.
             if prediction {
                 decode_predicted_u8(&mut decompressed, width * 4, height);
-            }
-            // Photoshop stores planar bytes: reconstruct big-endian floats.
-            let mut p = offset;
-            for y in 0..height {
-                let a0 = width * 4 * y;
-                for x in 0..width {
-                    let a = a0 + x;
-                    let b = a + width;
-                    let c = b + width;
-                    let d = c + width;
-                    if d >= decompressed.len() || p >= pixel_data.data.len() {
-                        break;
+                // Photoshop's predicted stream stores each byte plane in a
+                // row; reconstruct one float from the four planes.
+                let mut p = offset;
+                for y in 0..height {
+                    let a0 = width * 4 * y;
+                    for x in 0..width {
+                        let a = a0 + x;
+                        let b = a + width;
+                        let c = b + width;
+                        let d = c + width;
+                        if d >= decompressed.len() || p >= pixel_data.data.len() {
+                            break;
+                        }
+                        let v = f32::from_be_bytes([
+                            decompressed[a],
+                            decompressed[b],
+                            decompressed[c],
+                            decompressed[d],
+                        ]);
+                        pixel_data.data[p] = f32_sample_to_u8(v);
+                        p += step;
                     }
-                    let v = f32::from_be_bytes([
-                        decompressed[a],
-                        decompressed[b],
-                        decompressed[c],
-                        decompressed[d],
-                    ]);
-                    pixel_data.data[p] = f32_sample_to_u8(v);
+                }
+            } else {
+                // Without prediction, channels are ordinary big-endian
+                // float samples, matching the writer's expansion contract.
+                let mut p = offset;
+                for chunk in decompressed.chunks_exact(4).take(width * height) {
+                    pixel_data.data[p] = f32_sample_to_u8(f32::from_be_bytes(
+                        chunk.try_into().expect("exact four-byte float sample"),
+                    ));
                     p += step;
                 }
             }
@@ -2197,9 +2208,8 @@ pub fn read_data_zip(
     }
 }
 
-/// Mirror `readDataRLE` (PackBits). Writes one byte per sample to the 8-bit
-/// RGBA target. For >8 bit depths the source is still byte-stream PackBits, so
-/// we keep upstream's byte semantics (the upstream RLE path also writes bytes).
+/// Mirror `readDataRLE` (PackBits), down-converting 16/32-bit samples into the
+/// crate's RGBA8 target after each row has been decompressed.
 // Upstream exports `readDataRLE` with exactly these eight positional
 // parameters; this is a published function of the crate, so regrouping them
 // would break both the public API and the 1:1 correspondence with the
@@ -2210,7 +2220,7 @@ pub fn read_data_rle(
     mut pixel_data: Option<&mut DecodeTarget>,
     width: usize,
     height: usize,
-    _bit_depth: u32,
+    bit_depth: u32,
     step: usize,
     offsets: &[usize],
     large: bool,
@@ -2245,6 +2255,12 @@ pub fn read_data_rle(
             }
         }
 
+        let bytes_per_sample = match bit_depth {
+            8 => 1,
+            16 => 2,
+            32 => 4,
+            _ => return Ok(()),
+        };
         let extra_limit = step.saturating_sub(1);
 
         let mut li = 0usize;
@@ -2268,47 +2284,30 @@ pub fn read_data_rle(
                 let length = lengths[li] as usize;
                 li += 1;
                 let buffer = read_bytes(reader, length)?;
-
-                let mut i = 0usize;
-                let mut x = 0usize;
-                while i < length {
-                    let header = buffer[i];
-                    if header > 128 {
-                        i += 1;
-                        if i >= buffer.len() {
-                            break;
+                let decoded = decode_packbits_row(&buffer);
+                let sample_bytes = width.saturating_mul(bytes_per_sample);
+                let decoded = &decoded[..decoded.len().min(sample_bytes)];
+                for x in 0..width {
+                    let start = x * bytes_per_sample;
+                    let value = match bit_depth {
+                        8 if start < decoded.len() => decoded[start],
+                        16 if start + 1 < decoded.len() => {
+                            u16::from_be_bytes([decoded[start], decoded[start + 1]])
+                                .to_be_bytes()[0]
                         }
-                        let value = buffer[i];
-                        let count = 256 - header as usize;
-                        let mut j = 0;
-                        while j <= count && x < width {
-                            let pd = pixel_data.as_deref_mut_unchecked();
-                            if p < pd.data.len() {
-                                pd.data[p] = value;
-                            }
-                            p += step;
-                            j += 1;
-                            x += 1;
-                        }
-                    } else if header < 128 {
-                        let count = header as usize;
-                        let mut j = 0;
-                        while j <= count && x < width {
-                            i += 1;
-                            if i >= buffer.len() {
-                                break;
-                            }
-                            let value = buffer[i];
-                            let pd = pixel_data.as_deref_mut_unchecked();
-                            if p < pd.data.len() {
-                                pd.data[p] = value;
-                            }
-                            p += step;
-                            j += 1;
-                            x += 1;
-                        }
+                        32 if start + 3 < decoded.len() => f32_sample_to_u8(f32::from_be_bytes([
+                            decoded[start],
+                            decoded[start + 1],
+                            decoded[start + 2],
+                            decoded[start + 3],
+                        ])),
+                        _ => continue,
+                    };
+                    let pd = pixel_data.as_deref_mut_unchecked();
+                    if p < pd.data.len() {
+                        pd.data[p] = value;
                     }
-                    i += 1;
+                    p += step;
                 }
             }
             // assignment of p back happens implicitly via loop continuation; in
@@ -2318,6 +2317,29 @@ pub fn read_data_rle(
 
         Ok(())
     })
+}
+
+fn decode_packbits_row(buffer: &[u8]) -> Vec<u8> {
+    let mut decoded = Vec::new();
+    let mut i = 0usize;
+    while i < buffer.len() {
+        let header = buffer[i];
+        i += 1;
+        if header > 128 {
+            if i >= buffer.len() {
+                break;
+            }
+            let count = 257usize - header as usize;
+            decoded.extend(std::iter::repeat(buffer[i]).take(count));
+            i += 1;
+        } else if header < 128 {
+            let count = header as usize + 1;
+            let end = (i + count).min(buffer.len());
+            decoded.extend_from_slice(&buffer[i..end]);
+            i = end;
+        }
+    }
+    decoded
 }
 
 // Helper trait to reborrow Option<&mut T> inside the RLE inner loops without

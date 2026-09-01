@@ -70,15 +70,11 @@ const EXPECTED_READ_FAILURES: &[&str] = &["read/cmyk"];
 
 /// Fixtures that are expected to fail the read -> write -> read round trip, by name.
 ///
-/// All seven are faithful reproductions of an upstream *writer* limitation: ag-psd only
-/// writes 8-bit RGB. They must not be "fixed" without first changing that contract.
-///   - `read/16bits`, `read/32bits` — `bitsPerChannel != 8`, the writer panics by design;
-///   - `read/bitmap`, `read/bitmap-rle` — bitmap mode is likewise not 8 bits per channel;
+/// These are the remaining upstream *writer* mode limitations.
+///   - `read/bitmap`, `read/bitmap-rle` — bitmap mode is not RGB;
 ///   - `read/grayscale`, `read/grayscale-alpha` — colorMode Grayscale is written as RGB;
 ///   - `read/indexed` — colorMode Indexed is written as RGB.
 const EXPECTED_ROUND_TRIP_FAILURES: &[&str] = &[
-    "read/16bits",
-    "read/32bits",
     "read/bitmap",
     "read/bitmap-rle",
     "read/grayscale",

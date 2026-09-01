@@ -160,17 +160,16 @@ test fixtures:
 - **Reads** every upstream read fixture except the CMYK one, which is rejected
   by design (upstream's own test suite skips it too).
 - **Matches** the `data.json` ground truth that ships with those fixtures,
-  except for the 16-bit and 32-bit documents whose layers live in an
-  `Lr16`/`Lr32` section this port does not yet parse.
+  including the 16-bit and 32-bit layer sections.
 - **Round-trips** (read → write → read) with a structurally stable result
-  everywhere the 8-bit-RGB writer limitation below does not apply.
+  everywhere the mode limitations below do not apply.
 
-The writer intentionally inherits the same constraints as upstream `ag-psd`:
+The writer keeps the following mode constraints:
 
-- **Writing is 8-bit RGB only.** 16/32-bit, grayscale, indexed, bitmap and
-  duotone documents can be *read*, but are not re-emitted in their original
-  depth/mode. This matches upstream behavior and is the reason a handful of
-  fixtures do not byte-round-trip.
+- **Writing supports 8/16/32-bit RGB PSD/PSB.** `PixelData` remains RGBA8;
+  synthesized high-bit channels use the documented integer expansion and
+  normalized-float mapping. Grayscale, indexed, bitmap and duotone documents
+  can be read, but are not re-emitted in their original mode.
 - **CMYK** documents are rejected at the header on read.
 
 Known partial / stubbed areas (not required for the typesetting use case that
@@ -178,7 +177,7 @@ drove the port, but relevant if you need "100% complete"):
 
 - Vector gradient/pattern content (`Grad`/`Ptrn`), `vstk` stroke units,
   `vogk`/`pths` path lists.
-- `Lr16`/`Lr32` nested layers, `Psd.linked_files` storage, the smart-object
+- `Psd.linked_files` storage, the smart-object
   `SoLd` filter-FX subtree, `shmd` timeline/comps.
 - Thumbnail generation on write, link-group resources, `Txt2` text-path
   restoration.
