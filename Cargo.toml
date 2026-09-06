@@ -21,7 +21,8 @@ name = "ag_psd"
 # ZIP/RLE channel (de)compression for the reader/writer.
 flate2 = "1"
 
-# Standalone crate: it lives inside the ManhwaStudio checkout but must not be
-# pulled into that repo's cargo workspace (it is gitignored and consumed from
-# crates.io). An empty table opts this package out of any parent workspace.
+# Standalone crate: it lives inside the checkout of the application that uses
+# it, but must not be pulled into that repo's cargo workspace (it is gitignored
+# there and consumed from crates.io). An empty table opts this package out of
+# any parent workspace.
 [workspace]

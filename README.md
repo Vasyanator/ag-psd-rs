@@ -17,9 +17,9 @@ familiar if you've used the JavaScript version.
 >
 > The overwhelming majority of this code was written by **Claude** (Anthropic),
 > driven from the original TypeScript source as the specification and the
-> upstream test fixtures as the oracle. It is used in production in a manhwa
-> typesetting tool (PSD export of source / clean / editable text layers), but it
-> has **not** been hand-audited line by line. Treat it accordingly: it is well
+> upstream test fixtures as the oracle. It is used in production in a comic
+> typesetting application (PSD export of source / clean / editable text layers),
+> but it has **not** been hand-audited line by line. Treat it accordingly: it is well
 > tested against real fixtures, but it is not a battle-hardened, human-reviewed
 > codebase. Bug reports and PRs are very welcome.
 

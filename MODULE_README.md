@@ -8,8 +8,8 @@ Photoshop `.psd`/`.psb` documents, plus the companion Adobe formats that ship
 with upstream (`.abr`, `.csh`, `.ase`, Engine Data).
 
 The crate is **published on crates.io as `ag-psd`** and consumed from there by
-the ManhwaStudio application as an ordinary registry dependency. It is not a
-member of the ManhwaStudio cargo workspace: it lives inside that checkout for
+the surrounding application as an ordinary registry dependency. It is not a
+member of that application's cargo workspace: it lives inside its checkout for
 convenience only, is its own git repository
 (`https://github.com/Vasyanator/ag-psd-rs`), and carries an empty `[workspace]`
 table in `Cargo.toml` to opt out of any parent workspace. Build and test it from
