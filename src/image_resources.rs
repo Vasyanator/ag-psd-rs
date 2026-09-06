@@ -72,7 +72,8 @@ use crate::utf8::{decode_string, encode_string};
 use crate::writer::{
     write_ascii_string, write_bytes, write_color, write_fixed_point32, write_float32,
     write_float64, write_int16, write_int32, write_section, write_signature, write_uint16,
-    write_uint32, write_uint8, write_unicode_string, write_unicode_string_with_padding, PsdWriter,
+    write_uint32, write_uint8, write_unicode_string, write_unicode_string_with_padding,
+    write_zeros, PsdWriter,
 };
 
 // ===========================================================================
@@ -1804,6 +1805,51 @@ fn parse_animations(desc: &Descriptor) -> Animations {
     Animations { frames, animations }
 }
 
+/// Truncates a model `f64` to the `long` (int32) a descriptor field stores.
+///
+/// Upstream coerces these fields with JavaScript `| 0`, which truncates toward
+/// zero and then wraps modulo 2^32. This port truncates toward zero and clamps
+/// to the `i32` range instead of wrapping, so a nonsensical input stays as close
+/// to the caller's value as the field allows rather than turning into an
+/// unrelated number; every value that fits in an `i32` is encoded identically to
+/// upstream. `NaN` encodes as `0`, matching `NaN | 0` in JavaScript.
+fn descriptor_long(value: f64) -> i32 {
+    let truncated = value.trunc();
+    if truncated >= f64::from(i32::MAX) {
+        i32::MAX
+    } else if truncated <= f64::from(i32::MIN) {
+        i32::MIN
+    } else {
+        // Proven in range by the two guards above (and `NaN` fails both
+        // comparisons, for which the cast yields 0) — §17 "conversion is proven
+        // safe" exception.
+        truncated as i32
+    }
+}
+
+/// `FrDs` enum value for `dispose`, or `None` when the key must be omitted.
+///
+/// Photoshop omits `FrDs` entirely on automatic frames — verified on all five
+/// upstream animation fixtures — and upstream's reader documents the same rule
+/// ("missing == auto", `imageResources.ts:1451`). The key strings come from
+/// [`frmd_codec`]'s own map, so `encode` cannot fail here; an `Err` would mean
+/// the map and this match went out of sync, and the infallible write path drops
+/// the optional key rather than panicking.
+fn frmd_dispose_value(dispose: AnimationDispose) -> Option<String> {
+    let key = match dispose {
+        AnimationDispose::Auto => return None,
+        AnimationDispose::None => "none",
+        AnimationDispose::Dispose => "dispose",
+    };
+    frmd_codec().encode(Some(key)).ok()
+}
+
+/// Writes the `mani`/`IRFR` frame-animation payload of image resource 4000.
+///
+/// Mirrors upstream's handler, with three deliberate divergences, each verified
+/// against the five Photoshop-written fixtures that carry an animation resource
+/// (`animation-frame`, `animation-effects`, `animation-offset`, `lantern`,
+/// `layer-larger-than-drawing`); see the comments at each site.
 fn write_animations(writer: &mut PsdWriter, target: &ImageResources) {
     let Some(animations) = &target.animations else {
         return;
@@ -1821,59 +1867,95 @@ fn write_animations(writer: &mut PsdWriter, target: &ImageResources) {
                 1,
                 |writer| {
                     let mut desc = Descriptor::new("", "null");
+                    // DIVERGENCE from upstream: `AFSt` is commented out there
+                    // (`// AFSt: 0, // ???`), but every Photoshop-written fixture
+                    // carries it as the *first* key of the root descriptor with
+                    // the value 0, so it is written here in that position.
+                    desc.set("AFSt", DescriptorValue::Integer(0));
                     let mut fr_in = Vec::new();
                     for f in &animations.frames {
-                        let mut frame = Descriptor::new("", "AnFr");
-                        frame.set("FrID", DescriptorValue::Integer(f.id as i32));
+                        // The nested frame descriptor is `nullType` upstream
+                        // (`descriptor.ts:155` `FrIn: nullType` in
+                        // `fieldToArrayExtType`), i.e. classID "null", which is
+                        // what Photoshop writes. It used to say "AnFr" here — a
+                        // porting mistake, "AnSt"/"AnFr" being antialias enum
+                        // values in `descriptor.ts`, not animation class ids.
+                        let mut frame = Descriptor::new("", "null");
+                        frame.set("FrID", DescriptorValue::Integer(descriptor_long(f.id)));
                         if f.delay != 0.0 {
                             frame.set(
                                 "FrDl",
-                                DescriptorValue::Integer((f.delay * 100.0) as i32),
+                                DescriptorValue::Integer(descriptor_long(f.delay * 100.0)),
                             );
                         }
-                        frame.set(
-                            "FrDs",
-                            DescriptorValue::Enum(
-                                frmd_codec()
-                                    .encode(Some(match f.dispose.unwrap_or(AnimationDispose::Auto) {
-                                        AnimationDispose::Auto => "auto",
-                                        AnimationDispose::None => "none",
-                                        AnimationDispose::Dispose => "dispose",
-                                    }))
-                                    .unwrap(),
-                            ),
-                        );
+                        // DIVERGENCE from upstream: upstream always writes
+                        // `FrDs`, Photoshop omits it for automatic frames and
+                        // both readers treat a missing key as `auto`, so the
+                        // round trip is unchanged and the output matches
+                        // Photoshop byte for byte.
+                        if let Some(value) =
+                            frmd_dispose_value(f.dispose.unwrap_or(AnimationDispose::Auto))
+                        {
+                            frame.set("FrDs", DescriptorValue::Enum(value));
+                        }
                         fr_in.push(DescriptorValue::Descriptor(frame));
                     }
                     desc.set("FrIn", DescriptorValue::List(fr_in));
 
                     let mut f_sts = Vec::new();
                     for a in &animations.animations {
-                        let mut anim = Descriptor::new("", "AnSt");
-                        anim.set("FsID", DescriptorValue::Integer(a.id as i32));
+                        // classID "null" for the same reason as the frame
+                        // descriptor above (`descriptor.ts:156` `FSts: nullType`);
+                        // it used to say "AnSt".
+                        let mut anim = Descriptor::new("", "null");
+                        anim.set("FsID", DescriptorValue::Integer(descriptor_long(a.id)));
                         anim.set(
                             "AFrm",
-                            DescriptorValue::Integer(a.active_frame.unwrap_or(0.0) as i32),
+                            DescriptorValue::Integer(descriptor_long(a.active_frame.unwrap_or(0.0))),
                         );
                         let frames = a
                             .frames
                             .iter()
-                            .map(|f| DescriptorValue::Integer(*f as i32))
+                            .map(|f| DescriptorValue::Integer(descriptor_long(*f)))
                             .collect();
                         anim.set("FsFr", DescriptorValue::List(frames));
                         anim.set(
                             "LCnt",
-                            DescriptorValue::Integer(a.repeats.unwrap_or(0.0) as i32),
+                            DescriptorValue::Integer(descriptor_long(a.repeats.unwrap_or(0.0))),
                         );
                         f_sts.push(DescriptorValue::Descriptor(anim));
                     }
                     desc.set("FSts", DescriptorValue::List(f_sts));
 
+                    // No padding follows the descriptor, matching upstream's
+                    // `writeSection(writer, 1, ...)` (round = 1).
+                    //
+                    // What the corpus can and cannot say: every descriptor in the
+                    // tree contributes an 18-byte header, i.e. 2 (mod 4), so a
+                    // payload holding the root plus `N` frame and animation-set
+                    // descriptors is 2 * (N + 1) (mod 4) long — a multiple of four
+                    // exactly when `N` is odd. All five Photoshop fixtures have an
+                    // odd `N` (3, 3, 3, 9, 17), so their payloads are already
+                    // aligned and a pad-to-4 rule would have emitted zero padding
+                    // there too. The corpus therefore does NOT discriminate between
+                    // the two encodings, and Photoshop's behaviour for an even `N`
+                    // is unknown. We keep upstream's encoding because it is
+                    // upstream's, and because padding would leave bytes that
+                    // `read_animations` stops short of, making our own reader
+                    // report unread section data.
                     write_version_and_descriptor(writer, &desc);
                 },
                 false,
                 false,
             );
+            // DIVERGENCE from upstream, where this block is commented out: every
+            // Photoshop-written animation resource ends with an empty `Roll`
+            // block (`8BIM` `Roll`, length 8, eight zero bytes), so it is
+            // reproduced here. `read_animations` skips it like Photoshop's own
+            // reader skips unknown sub-blocks.
+            write_signature(writer, "8BIM");
+            write_signature(writer, "Roll");
+            write_section(writer, 1, |writer| write_zeros(writer, 8), false, false);
         },
         false,
         false,
@@ -2208,6 +2290,219 @@ mod tests {
         assert_eq!(a.animations[0].id, 10.0);
         assert_eq!(a.animations[0].frames, vec![1.0, 2.0]);
         assert_eq!(a.animations[0].repeats, Some(3.0));
+    }
+
+    /// Builds the `ImageResources` used by the animation layout tests: two
+    /// frames (automatic and `dispose`) and one animation set.
+    fn animation_sample() -> ImageResources {
+        ImageResources {
+            animations: Some(Animations {
+                frames: vec![
+                    AnimationFrameInfo {
+                        id: 393_816_367.0,
+                        delay: 0.3,
+                        dispose: Some(AnimationDispose::Auto),
+                    },
+                    AnimationFrameInfo {
+                        id: 393_833_174.0,
+                        delay: 0.3,
+                        dispose: Some(AnimationDispose::Dispose),
+                    },
+                ],
+                animations: vec![AnimationInfo {
+                    id: 0.0,
+                    frames: vec![393_816_367.0, 393_833_174.0],
+                    repeats: Some(0.0),
+                    active_frame: Some(0.0),
+                }],
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The written resource must reproduce the framing of a Photoshop-written
+    /// `mani`/`IRFR` payload: an `AnDs` block that ends exactly where its
+    /// descriptor ends (no alignment padding), followed by an empty `Roll` block.
+    #[test]
+    fn animations_match_photoshop_framing() {
+        let target = animation_sample();
+        let mut w = create_writer(512);
+        write_image_resource(4000, &mut w, &target, 0).unwrap();
+        let bytes = get_writer_buffer(&w);
+
+        let mut r = PsdReader::new(&bytes, None, None);
+        assert_eq!(read_signature(&mut r).unwrap(), "mani");
+        assert_eq!(read_signature(&mut r).unwrap(), "IRFR");
+        let section_len = read_uint32(&mut r).unwrap() as usize;
+        assert_eq!(section_len, bytes.len() - r.offset);
+
+        assert_eq!(read_signature(&mut r).unwrap(), "8BIM");
+        assert_eq!(read_signature(&mut r).unwrap(), "AnDs");
+        let ands_len = read_uint32(&mut r).unwrap() as usize;
+        let ands_start = r.offset;
+        let desc = read_version_and_descriptor(&mut r).unwrap();
+        // The descriptor consumes the whole block: Photoshop writes no padding
+        // after it, and neither do we.
+        assert_eq!(r.offset - ands_start, ands_len);
+
+        assert_eq!(read_signature(&mut r).unwrap(), "8BIM");
+        assert_eq!(read_signature(&mut r).unwrap(), "Roll");
+        assert_eq!(read_uint32(&mut r).unwrap(), 8);
+        assert_eq!(&bytes[r.offset..r.offset + 8], &[0u8; 8]);
+        assert_eq!(r.offset + 8, bytes.len());
+
+        // Root descriptor: classID "null", `AFSt` first, then `FrIn`, `FSts`.
+        assert_eq!(desc.class_id, "null");
+        let keys: Vec<&str> = desc.items.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["AFSt", "FrIn", "FSts"]);
+        assert_eq!(desc.get("AFSt"), Some(&DescriptorValue::Integer(0)));
+    }
+
+    /// Regression test for the port bug: the nested frame and animation-set
+    /// descriptors are `nullType` upstream (`FrIn`/`FSts` in
+    /// `fieldToArrayExtType`), so their classID must be "null" — it used to be
+    /// written as "AnFr"/"AnSt".
+    #[test]
+    fn animation_nested_descriptors_use_null_class_id() {
+        let target = animation_sample();
+        let mut w = create_writer(512);
+        write_image_resource(4000, &mut w, &target, 0).unwrap();
+        let bytes = get_writer_buffer(&w);
+
+        let desc = read_animation_descriptor(&bytes);
+        let frames = get_list(&desc, "FrIn").unwrap();
+        assert_eq!(frames.len(), 2);
+        for frame in frames {
+            match frame {
+                DescriptorValue::Descriptor(d) => {
+                    assert_eq!(d.class_id, "null");
+                    assert_eq!(d.name, "");
+                }
+                other => panic!("expected a frame descriptor, got {other:?}"),
+            }
+        }
+        let sets = get_list(&desc, "FSts").unwrap();
+        assert_eq!(sets.len(), 1);
+        for set in sets {
+            match set {
+                DescriptorValue::Descriptor(d) => {
+                    assert_eq!(d.class_id, "null");
+                    assert_eq!(d.name, "");
+                }
+                other => panic!("expected an animation-set descriptor, got {other:?}"),
+            }
+        }
+        assert!(!bytes.windows(4).any(|w| w == b"AnFr" || w == b"AnSt"));
+    }
+
+    /// `FrDs` is omitted for automatic frames (as Photoshop does) and written
+    /// otherwise; a missing key still reads back as [`AnimationDispose::Auto`].
+    #[test]
+    fn animation_dispose_key_is_omitted_when_automatic() {
+        let target = animation_sample();
+        let mut w = create_writer(512);
+        write_image_resource(4000, &mut w, &target, 0).unwrap();
+        let bytes = get_writer_buffer(&w);
+
+        let desc = read_animation_descriptor(&bytes);
+        let frames = get_list(&desc, "FrIn").unwrap();
+        let frame_keys = |index: usize| -> Vec<String> {
+            match &frames[index] {
+                DescriptorValue::Descriptor(d) => {
+                    d.items.iter().map(|(k, _)| k.clone()).collect()
+                }
+                other => panic!("expected a frame descriptor, got {other:?}"),
+            }
+        };
+        assert_eq!(frame_keys(0), vec!["FrID", "FrDl"]);
+        assert_eq!(frame_keys(1), vec!["FrID", "FrDl", "FrDs"]);
+
+        let mut r = PsdReader::new(&bytes, None, None);
+        let mut out = ImageResources::default();
+        read_image_resource(4000, &mut r, &mut out, bytes.len()).unwrap();
+        let a = out.animations.unwrap();
+        assert_eq!(a.frames[0].dispose, Some(AnimationDispose::Auto));
+        assert_eq!(a.frames[1].dispose, Some(AnimationDispose::Dispose));
+    }
+
+    /// Frame counts of both parities round-trip through our own reader, including
+    /// the `N`-even case that no Photoshop fixture covers (see the padding note in
+    /// [`write_animations`]).
+    #[test]
+    fn animations_round_trip_for_any_frame_count() {
+        for frame_count in [1usize, 2, 3, 9, 12, 13] {
+            let frames: Vec<AnimationFrameInfo> = (0..frame_count)
+                .map(|i| AnimationFrameInfo {
+                    id: (i + 1) as f64,
+                    delay: 0.1,
+                    dispose: Some(AnimationDispose::None),
+                })
+                .collect();
+            let ids: Vec<f64> = frames.iter().map(|f| f.id).collect();
+            let target = ImageResources {
+                animations: Some(Animations {
+                    frames,
+                    animations: vec![AnimationInfo {
+                        id: 0.0,
+                        frames: ids.clone(),
+                        repeats: Some(0.0),
+                        active_frame: Some(0.0),
+                    }],
+                }),
+                ..Default::default()
+            };
+
+            // Go through the full resource-block framing so the even-padding of
+            // the block itself is exercised too.
+            let bytes = write_block(4000, "", &target, 0);
+            let out = read_block(&bytes);
+            let a = out.animations.unwrap_or_else(|| {
+                panic!("animations missing after round trip for {frame_count} frames")
+            });
+            assert_eq!(a.frames.len(), frame_count);
+            assert_eq!(a.animations[0].frames, ids);
+        }
+    }
+
+    /// The `FrDs` mapping must be the one Photoshop writes, and an automatic
+    /// frame must map to no key at all. This also pins the invariant that
+    /// [`frmd_dispose_value`] relies on: its keys exist in [`frmd_codec`]'s map.
+    #[test]
+    fn frmd_dispose_value_matches_photoshop_enum_values() {
+        assert_eq!(frmd_dispose_value(AnimationDispose::Auto), None);
+        assert_eq!(
+            frmd_dispose_value(AnimationDispose::None),
+            Some("FrmD.None".to_string())
+        );
+        assert_eq!(
+            frmd_dispose_value(AnimationDispose::Dispose),
+            Some("FrmD.Disp".to_string())
+        );
+    }
+
+    /// `long` descriptor fields truncate toward zero and clamp instead of
+    /// wrapping; `NaN` encodes as 0 like JavaScript's `NaN | 0`.
+    #[test]
+    fn descriptor_long_truncates_and_clamps() {
+        assert_eq!(descriptor_long(30.0), 30);
+        assert_eq!(descriptor_long(29.9), 29);
+        assert_eq!(descriptor_long(-1.9), -1);
+        assert_eq!(descriptor_long(393_833_174.0), 393_833_174);
+        assert_eq!(descriptor_long(3e9), i32::MAX);
+        assert_eq!(descriptor_long(-3e9), i32::MIN);
+        assert_eq!(descriptor_long(f64::NAN), 0);
+    }
+
+    /// Reads the `AnDs` descriptor out of a written `mani`/`IRFR` payload.
+    fn read_animation_descriptor(bytes: &[u8]) -> Descriptor {
+        let mut r = PsdReader::new(bytes, None, None);
+        check_signature(&mut r, "mani", None).unwrap();
+        check_signature(&mut r, "IRFR", None).unwrap();
+        let _section_len = read_uint32(&mut r).unwrap();
+        check_signature(&mut r, "8BIM", None).unwrap();
+        check_signature(&mut r, "AnDs", None).unwrap();
+        let _len = read_uint32(&mut r).unwrap();
+        read_version_and_descriptor(&mut r).unwrap()
     }
 
     #[test]
