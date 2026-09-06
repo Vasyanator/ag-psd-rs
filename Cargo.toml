@@ -1,6 +1,6 @@
 [package]
 name = "ag-psd"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Read and write Adobe Photoshop (.psd/.psb) files — a from-scratch Rust port of the ag-psd TypeScript library."

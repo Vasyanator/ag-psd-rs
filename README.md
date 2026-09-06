@@ -205,6 +205,9 @@ shows up as a new name rather than a slipped percentage.
 - Original PSD format reverse-engineering and structure courtesy of the upstream
   project and the Adobe Photoshop File Format specification.
 - Rust port: vibe-coded by Claude (Anthropic), maintained by Vasyanator.
+- 16- and 32-bit writing and the frame-animation groundwork originate in
+  [`minerva-studio/ag-psd-rs`](https://github.com/minerva-studio/ag-psd-rs) by
+  Chad-Vine-Doll, adopted here with authorship preserved in the git history.
 
 Licensed under the **MIT License**, the same as upstream. The original
 copyright © 2016 Agamnentzar is preserved; see

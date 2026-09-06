@@ -4,6 +4,87 @@ All notable changes to this crate are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-09-06
+
+### Added
+
+- **Writing 16- and 32-bit RGB documents (PSD and PSB).** `Psd::bits_per_channel`
+  may now be 16 or 32 as well as 8. RGBA8 samples are widened on the way out —
+  16-bit as `sample * 257`, 32-bit as `sample / 255.0` in big-endian IEEE-754 —
+  and layer records go into a document-level `Lr16`/`Lr32` tagged block, which
+  is where Photoshop reads them from; the ordinary layer-info section is left
+  empty for such documents. This extends upstream ag-psd, which writes 8-bit
+  only. Consequently `read/16bits` and `read/32bits` are no longer expected
+  round-trip failures in the fixture suite.
+- `helpers::write_data_raw_bit_depth`, `helpers::write_data_rle_bit_depth`,
+  `helpers::write_data_zip_without_prediction_bit_depth`,
+  `helpers::expand_channel_samples` and `helpers::bytes_per_sample`: the
+  bit-depth-aware channel writers.
+- `helpers::RleEncodeError`: the typed reason a high-depth PackBits channel
+  cannot be produced — an unsupported depth, an invalid bitmap, or a row longer
+  than a PSD row-length entry can address (use PSB). It is reported instead of
+  emitting a shorter, silently corrupt channel.
+- The reader accepts ZIP channel streams in **both** framings: zlib-wrapped
+  deflate (what Photoshop, upstream and this crate's writer emit) and bare
+  DEFLATE (emitted by some third-party writers). The writer is unchanged and
+  stays zlib-wrapped, matching upstream's pako `deflate`.
+- The reader decodes ZIP composite image data and 16/32-bit pattern channels,
+  both of which previously errored.
+
+### Fixed
+
+- **Frame animation descriptors were written with the wrong class id.** The
+  nested frame and animation-set descriptors of image resource #4000 were built
+  as `AnFr` and `AnSt`; upstream maps `FrIn` and `FSts` to `nullType`, so the
+  class id must be `null`. (`AnSt` is upstream's *antialias* enum value, which
+  is most likely where the porting mistake came from.) Every animated document
+  this crate wrote carried the defect. The read path was never affected — it
+  does not inspect the class id, which is why a round-trip test could not see
+  the bug. After the fix, resource #4000 is reproduced byte-for-byte for three
+  of the five animated fixtures in the upstream corpus.
+- `writer::add_children` and `writer::get_largest_layer_size` walk the layer
+  tree with an explicit stack instead of recursion, and a group's closing folder
+  record no longer deep-copies the subtree it discards. A deeply nested document
+  no longer overflows the stack or costs quadratic work.
+- `helpers::write_data_raw` returns `None` instead of panicking when the pixel
+  buffer is shorter than the declared `width * height * 4`.
+- PackBits encoding no longer emits a literal header of 128 (a decoder no-op)
+  for literal runs that overshot the 128-byte limit.
+- The ZIP scratch buffer used to find a composite channel's compressed length is
+  charged against `ReadOptions::total_memory_limit` and refunded, error paths
+  included, like every other read-path allocation. That length is also checked
+  to decompress to exactly one bitmap's worth of samples, so a short stream
+  cannot advance the cursor into the middle of the next channel.
+- **PackBits row decompression is bounded by the declared row size.** PackBits
+  amplifies by up to 64x, so a hostile row could otherwise decode into an
+  unbounded buffer outside `ReadOptions::total_memory_limit` — a 1 MiB row
+  expanded to 64 MiB for a bitmap declaring four pixels. `decode_packbits_row`
+  now stops at `width * bytes_per_sample`.
+
+### Deliberate divergences from upstream
+
+- **Animation image resource #4000 gains three keys upstream omits.** Every
+  animated `.psd` written by Photoshop in the upstream fixture corpus (five
+  files) begins the resource with `AFSt` (a long, 0) and carries an `8BIM`/`Roll`
+  block of eight zero bytes; upstream has code for both, commented out. Both are
+  now written. Photoshop also omits `FrDs` for frames using the automatic
+  disposal method, and upstream's own reader documents a missing `FrDs` as
+  automatic, so it is omitted rather than written explicitly.
+- **The `AnDs` payload is not padded to a four-byte boundary**, matching
+  upstream's `writeSection(round = 1)`. This is the one animation decision the
+  corpus cannot settle: a payload holding a root plus `N` frame/set descriptors
+  is a multiple of four exactly when `N` is odd, and all five Photoshop samples
+  have an odd `N` (3, 3, 3, 9, 17), so padding and no padding produce identical
+  bytes for every file available to test against. Photoshop's behaviour for an
+  even `N` is unknown. Padding would also leave bytes our own reader stops short
+  of, making it report unread section data.
+- **The reader still registers image resource #4000 only**, not the whole
+  `4000..=4999` range: that is Adobe's generic "Plug-In resources" range, and the
+  same fixtures carry an unrelated `mfri` blob at 4001.
+- **16- and 32-bit writing extends upstream**, which writes 8-bit only; see
+  *Added* above. The composite image remains PackBits at every depth, because
+  upstream records that Photoshop does not support ZIP-compressed composite data.
+
 ## [0.2.0] - 2026-08-03
 
 Synchronises the port with upstream [`ag-psd`](https://github.com/Agamnentzar/ag-psd)

@@ -71,6 +71,10 @@ primitives; nothing depends on `lib.rs`. The per-file map lives in
   overrun returns `reader::ReadError::ExceededMemoryLimit`. Because of this,
   `ReadOptions` implements `Default` by hand — it is *not* an all-`None` value.
   Scratch charges are refunded when the buffer dies, error path included.
+  A decoder that can amplify its input must additionally be *bounded*, not
+  merely charged: `reader::decode_packbits_row` takes the row size it is
+  allowed to produce, because PackBits expands by up to 64x and an unbounded
+  decode would allocate outside the budget entirely.
 - **Box validation.** Layer, mask, real-mask and pattern rectangles are validated
   immediately after they are read; an inverted rectangle or a side above 30000
   (300000 for PSB) returns `reader::ReadError::InvalidBoxSize`. Patterns go
@@ -86,14 +90,25 @@ primitives; nothing depends on `lib.rs`. The per-file map lives in
 - **Errors.** The read path returns the typed `reader::ReadError` and must never
   panic on malformed input; index and size arithmetic is checked. The write path
   is infallible by design and reproduces upstream's silently-truncating buffer
-  semantics, so writer scratch buffers must be sized correctly rather than
-  guarded at use time: `writer::rle_scratch_size` is the single source of that
-  size, and its doc comment explains the PSB row-length entry width — 4 bytes,
-  where upstream hardcodes 2 — which is a deliberate divergence.
+  semantics for 8-bit RLE, so writer scratch buffers must be sized correctly
+  rather than guarded at use time: `writer::rle_scratch_size` is the single
+  source of that size, and its doc comment explains the PSB row-length entry
+  width — 4 bytes, where upstream hardcodes 2 — which is a deliberate
+  divergence. The high-depth encoders do not inherit those semantics: they
+  allocate exactly, and report input the container cannot represent as
+  `helpers::RleEncodeError`, which `writer::encode_channel` turns into a panic
+  with the encoder's diagnostic (the write path has no other way to say no).
 - **Byte order and framing.** PSD is big-endian; padding, section framing and
-  key ordering are byte-exact against upstream.
-- **Writer scope.** Writing is 8-bit RGB only, faithful to upstream. Other modes
-  and depths can be read but are not re-emitted in their original form.
+  key ordering are byte-exact against upstream, with one recorded exception:
+  animation image resource #4000 follows Photoshop rather than upstream and
+  writes three keys upstream leaves commented out (see `CHANGELOG.md`,
+  *Deliberate divergences*). ZIP channel streams are written
+  zlib-wrapped, matching upstream's pako `deflate`; the reader additionally
+  accepts bare DEFLATE, which some third-party writers emit.
+- **Writer scope.** Writing is RGB at 8, 16 or 32 bits per channel; 16- and
+  32-bit documents carry their layer records in a document-level `Lr16`/`Lr32`
+  block, as Photoshop does. This extends upstream, which writes 8-bit only.
+  Other colour modes can be read but are re-emitted as RGB.
 - **Public API.** The crate root mirrors upstream `index.ts`. Symbols with no
   upstream counterpart (`write_csh`, `write_ase`) are marked as such at their
   declaration.

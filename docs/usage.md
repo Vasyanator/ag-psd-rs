@@ -459,9 +459,17 @@ let group = Layer {
   both are `PixelData`.
 - For the document to display correctly in apps that only read the flattened
   image, set `Psd.image_data` (or `Psd.canvas`) to your composite.
-- **The writer is 8-bit RGB only.** Set `color_mode: Some(ColorMode::Rgb)`,
-  `bits_per_channel: Some(8.0)`. Other modes/depths can be read but not written
-  in their original form (same constraint as upstream `ag-psd`).
+- **The writer is RGB only, at 8, 16 or 32 bits per channel.** Set
+  `color_mode: Some(ColorMode::Rgb)` and `bits_per_channel` to `Some(8.0)`,
+  `Some(16.0)` or `Some(32.0)`. Pixels are always supplied as RGBA8 and widened
+  on the way out (16-bit as `sample * 257`, 32-bit as `sample / 255.0`), so a
+  high-depth document built from RGBA8 pixels carries 8 bits of real precision:
+  the depth is what Photoshop sees, not new information. Full precision *is*
+  preserved on the round-trip path — channels read under
+  `ReadOptions::use_raw_data` are re-emitted verbatim at their original depth,
+  without passing through RGBA8. Writing 16/32-bit extends upstream `ag-psd`,
+  which writes 8-bit only. Other colour modes can be read but not written in
+  their original form.
 
 ---
 
