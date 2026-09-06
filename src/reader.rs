@@ -23,7 +23,20 @@ Key functions:
   conversion of a validated rectangle into `usize` extents;
 - read_pattern: the crate's single implementation of the pattern-record
   primitive, also called by `additional_info::smart_object_keys` (`Patt`/`Pat2`/
-  `Pat3`) and by `abr` (the `patt` section).
+  `Pat3`) and by `abr` (the `patt` section);
+- inflate_channel_stream / has_zlib_header / zip_stream_length: ZIP channel
+  decoding. Photoshop, upstream and this crate's writer emit zlib-wrapped
+  deflate, but some third-party writers emit bare DEFLATE, so both framings are
+  accepted; `zip_stream_length` recovers the byte length of one stream for the
+  composite section, which stores ZIP channels back to back with no length
+  table, and charges its scratch buffer against the memory budget;
+- sample_to_u8: the single place 16/32-bit channel samples are narrowed to the
+  crate's RGBA8 model (16-bit keeps the high byte, 32-bit clamps the float to
+  `0.0..=1.0` and scales by 255);
+- decode_packbits_row: PackBits row decompression, bounded by the row size the
+  caller declared. PackBits amplifies by up to 64x, so decoding a row in full
+  before clamping it would let a hostile file allocate gigabytes outside the
+  memory budget — the bound is a security property, not an optimization.
 
 Notes:
 Validation happens as early as possible: rectangles are checked right after they
@@ -2090,6 +2103,25 @@ fn bytes_to_u8_channel(buffer: &[u8], bit_depth: u32) -> Vec<u8> {
     }
 }
 
+/// Down-converts one big-endian channel sample to the crate's RGBA8 target byte.
+///
+/// `bytes` must start at the sample and be at least
+/// `helpers::bytes_per_sample(bit_depth)` long; a shorter slice yields 0. A
+/// 16-bit sample keeps its most significant byte (the exact inverse of the
+/// writer's `sample * 257` expansion), and a 32-bit float is clamped to
+/// `0.0..=1.0` and scaled by 255. An unsupported depth yields 0 — callers
+/// reject such depths before decoding.
+fn sample_to_u8(bytes: &[u8], bit_depth: u32) -> u8 {
+    match bit_depth {
+        8 | 16 => bytes.first().copied().unwrap_or(0),
+        32 => bytes
+            .get(..4)
+            .and_then(|b| <[u8; 4]>::try_from(b).ok())
+            .map_or(0, |b| f32_sample_to_u8(f32::from_be_bytes(b))),
+        _ => 0,
+    }
+}
+
 fn decode_predicted_u8(data: &mut [u8], width: usize, height: usize) {
     for y in 0..height {
         let offset = y * width;
@@ -2110,6 +2142,108 @@ fn decode_predicted_u16(data: &mut [u16], width: usize, height: usize) {
     }
 }
 
+/// Length in bytes of the compressed channel stream starting at the reader's
+/// cursor, found by inflating it and asking the decompressor how much it read.
+///
+/// The composite image section stores ZIP channels back to back with no length
+/// table, so the only way to find where one ends is to decompress it. The
+/// cursor is *not* moved; the caller advances it by the returned length.
+///
+/// `expected_output` is `width * height * bytes_per_sample` — the exact size of
+/// one decompressed channel. That scratch buffer is charged against
+/// [`crate::psd::ReadOptions::total_memory_limit`] for the duration of the call
+/// and refunded afterwards, error paths included, per the crate's memory
+/// budget contract.
+///
+/// Both channel framings are accepted, exactly like [`inflate_channel_stream`].
+///
+/// # Errors
+/// [`ReadError::ExceededMemoryLimit`] if the scratch buffer does not fit the
+/// budget, and [`ReadError::StrictViolation`] if no stream ending at exactly
+/// `expected_output` bytes decodes here under either framing. The exact-size
+/// check is what makes the recovered length trustworthy: a channel of the
+/// declared bitmap must produce exactly one bitmap's worth of samples, and a
+/// stream that stops short would otherwise hand the caller a cursor advance
+/// that lands in the middle of the next channel.
+fn zip_stream_length(reader: &mut PsdReader, expected_output: usize) -> ReadResult<usize> {
+    use flate2::{Decompress, FlushDecompress, Status};
+
+    // `buffer` is a shared slice reference, so copying it out keeps the scratch
+    // closure from holding a borrow of `reader`.
+    let start = reader.offset.min(reader.buffer.len());
+    let input: &[u8] = &reader.buffer[start..];
+    let zlib_first = has_zlib_header(input);
+
+    with_scratch_memory(reader, expected_output, |_| {
+        let mut output = vec![0u8; expected_output];
+        for attempt in 0..2 {
+            let zlib_wrapped = if attempt == 0 { zlib_first } else { !zlib_first };
+            let mut decompressor = Decompress::new(zlib_wrapped);
+            // A stream longer than `expected_output` fills `output` and yields
+            // `Status::Ok` instead of `StreamEnd`, so only the short case has
+            // to be rejected explicitly.
+            if let Ok(Status::StreamEnd) =
+                decompressor.decompress(input, &mut output, FlushDecompress::Finish)
+            {
+                if u64::try_from(expected_output).is_ok_and(|n| decompressor.total_out() == n) {
+                    // `total_in` counts the bytes of this stream only, so it is
+                    // bounded by `input.len()` and always fits `usize`.
+                    return usize::try_from(decompressor.total_in())
+                        .map_err(|_| ReadError::UnexpectedEndOfBuffer);
+                }
+            }
+        }
+        Err(ReadError::StrictViolation(format!(
+            "Invalid ZIP channel data at 0x{:x}: no zlib or raw DEFLATE stream of {} bytes decodes here",
+            start, expected_output
+        )))
+    })
+}
+
+/// Whether a compressed channel stream starts with an RFC 1950 zlib header.
+///
+/// The header is two bytes: the low nibble of CMF is the compression method (8
+/// for deflate) and `CMF * 256 + FLG` is a multiple of 31. A raw RFC 1951
+/// stream passes this test only by coincidence, which is why the framing is
+/// probed in this order rather than by trying to inflate twice.
+fn has_zlib_header(data: &[u8]) -> bool {
+    match data {
+        [cmf, flg, ..] => {
+            (cmf & 0x0f) == 8 && (u16::from(*cmf) * 256 + u16::from(*flg)) % 31 == 0
+        }
+        _ => false,
+    }
+}
+
+/// Inflates one compressed channel stream, accepting both framings found in the
+/// wild.
+///
+/// Photoshop, upstream ag-psd and this crate's writer all emit zlib-wrapped
+/// deflate (RFC 1950), but some third-party PSD writers emit a bare deflate
+/// stream (RFC 1951). The framing suggested by [`has_zlib_header`] is tried
+/// first and the other one is the fallback, so neither form is rejected.
+///
+/// Returns `None` when the data decodes under neither framing.
+fn inflate_channel_stream(compressed: &[u8]) -> Option<Vec<u8>> {
+    use flate2::read::{DeflateDecoder, ZlibDecoder};
+    use std::io::Read;
+
+    let mut zlib_first = has_zlib_header(compressed);
+    for _ in 0..2 {
+        let mut decompressed: Vec<u8> = Vec::new();
+        let read = if zlib_first {
+            ZlibDecoder::new(compressed).read_to_end(&mut decompressed)
+        } else {
+            DeflateDecoder::new(compressed).read_to_end(&mut decompressed)
+        };
+        if read.is_ok() {
+            return Some(decompressed);
+        }
+        zlib_first = !zlib_first;
+    }
+    None
+}
+
 /// Mirror `readDataZip` (zlib via flate2).
 // Upstream exports `readDataZip` with exactly these eight positional
 // parameters; this is a published function of the crate, so regrouping them
@@ -2126,14 +2260,10 @@ pub fn read_data_zip(
     offset: usize,
     prediction: bool,
 ) {
-    use flate2::read::ZlibDecoder;
-    use std::io::Read;
-
-    let mut decoder = ZlibDecoder::new(compressed);
-    let mut decompressed: Vec<u8> = Vec::new();
-    if decoder.read_to_end(&mut decompressed).is_err() {
-        return;
-    }
+    let mut decompressed = match inflate_channel_stream(compressed) {
+        Some(data) => data,
+        None => return,
+    };
 
     let pixel_data = match pixel_data {
         Some(p) => p,
@@ -2195,11 +2325,19 @@ pub fn read_data_zip(
             } else {
                 // Without prediction, channels are ordinary big-endian
                 // float samples, matching the writer's expansion contract.
+                // `chunks_exact` yields only full four-byte chunks, but the
+                // sample count is file-derived, so the destination index is
+                // bounds-checked rather than trusted.
                 let mut p = offset;
                 for chunk in decompressed.chunks_exact(4).take(width * height) {
-                    pixel_data.data[p] = f32_sample_to_u8(f32::from_be_bytes(
-                        chunk.try_into().expect("exact four-byte float sample"),
-                    ));
+                    if p >= pixel_data.data.len() {
+                        break;
+                    }
+                    let sample = match <[u8; 4]>::try_from(chunk) {
+                        Ok(bytes) => f32::from_be_bytes(bytes),
+                        Err(_) => break,
+                    };
+                    pixel_data.data[p] = f32_sample_to_u8(sample);
                     p += step;
                 }
             }
@@ -2255,12 +2393,14 @@ pub fn read_data_rle(
             }
         }
 
-        let bytes_per_sample = match bit_depth {
-            8 => 1,
-            16 => 2,
-            32 => 4,
-            _ => return Ok(()),
-        };
+        // The PackBits stream is a byte stream whatever the depth, but how many
+        // of those bytes make one sample decides the down-conversion below.
+        let bytes_per_sample = crate::helpers::bytes_per_sample(bit_depth).ok_or_else(|| {
+            ReadError::StrictViolation(format!(
+                "Unsupported bit depth for RLE channel data: {}",
+                bit_depth
+            ))
+        })?;
         let extra_limit = step.saturating_sub(1);
 
         let mut li = 0usize;
@@ -2279,31 +2419,31 @@ pub fn read_data_rle(
                 continue;
             }
 
+            // `have_data` above proved this is `Some`; reborrowing it once
+            // here instead of per pixel removes the only place in this
+            // function that had to assert the invariant at run time.
+            let Some(pd) = pixel_data.as_deref_mut() else {
+                continue;
+            };
+
+            // The row a PackBits stream is allowed to produce. Decoding stops
+            // there, so a hostile row cannot amplify into an unbounded buffer.
+            let row_bytes = width.saturating_mul(bytes_per_sample);
+
             let mut p = offset;
             for _ in 0..height {
                 let length = lengths[li] as usize;
                 li += 1;
                 let buffer = read_bytes(reader, length)?;
-                let decoded = decode_packbits_row(&buffer);
-                let sample_bytes = width.saturating_mul(bytes_per_sample);
-                let decoded = &decoded[..decoded.len().min(sample_bytes)];
+                let decoded = decode_packbits_row(&buffer, row_bytes);
                 for x in 0..width {
                     let start = x * bytes_per_sample;
-                    let value = match bit_depth {
-                        8 if start < decoded.len() => decoded[start],
-                        16 if start + 1 < decoded.len() => {
-                            u16::from_be_bytes([decoded[start], decoded[start + 1]])
-                                .to_be_bytes()[0]
-                        }
-                        32 if start + 3 < decoded.len() => f32_sample_to_u8(f32::from_be_bytes([
-                            decoded[start],
-                            decoded[start + 1],
-                            decoded[start + 2],
-                            decoded[start + 3],
-                        ])),
-                        _ => continue,
+                    let Some(sample) = decoded.get(start..start + bytes_per_sample) else {
+                        // The row decompressed short: every remaining pixel is
+                        // missing too, so stop instead of scanning past it.
+                        break;
                     };
-                    let pd = pixel_data.as_deref_mut_unchecked();
+                    let value = sample_to_u8(sample, bit_depth);
                     if p < pd.data.len() {
                         pd.data[p] = value;
                     }
@@ -2319,39 +2459,47 @@ pub fn read_data_rle(
     })
 }
 
-fn decode_packbits_row(buffer: &[u8]) -> Vec<u8> {
-    let mut decoded = Vec::new();
+/// Decompresses one PackBits row, stopping after `max_len` bytes.
+///
+/// A header byte of `0..=127` introduces a literal run of `header + 1` bytes,
+/// `129..=255` a repeat of the following byte `257 - header` times, and `128`
+/// is a no-op. A truncated row stops decoding instead of erroring, mirroring
+/// upstream's tolerance for short channel data.
+///
+/// `max_len` is the number of bytes the caller can actually consume — one row,
+/// `width * bytes_per_sample`. It is a hard bound, not a post-hoc clamp, and it
+/// is the reason this function is safe on untrusted input: PackBits amplifies
+/// by up to 64x (a two-byte run header expands to 128 bytes), so decoding a
+/// hostile row in full would allocate gigabytes for a bitmap declared to be a
+/// few pixels wide, outside the `ReadOptions::total_memory_limit` budget. The
+/// returned buffer therefore never exceeds `max_len` bytes.
+pub(crate) fn decode_packbits_row(buffer: &[u8], max_len: usize) -> Vec<u8> {
+    // Reserve the smaller of the two bounds: what the caller will consume, and
+    // the most this input could possibly expand to (64x plus one run). A bogus
+    // `max_len` therefore cannot allocate ahead of the data justifying it.
+    let capacity = max_len.min(buffer.len().saturating_mul(64).saturating_add(128));
+    let mut decoded = Vec::with_capacity(capacity);
     let mut i = 0usize;
-    while i < buffer.len() {
+    while i < buffer.len() && decoded.len() < max_len {
+        let remaining = max_len - decoded.len();
         let header = buffer[i];
         i += 1;
         if header > 128 {
             if i >= buffer.len() {
                 break;
             }
-            let count = 257usize - header as usize;
-            decoded.extend(std::iter::repeat(buffer[i]).take(count));
+            let count = (257usize - usize::from(header)).min(remaining);
+            decoded.extend(std::iter::repeat_n(buffer[i], count));
             i += 1;
         } else if header < 128 {
-            let count = header as usize + 1;
+            let count = usize::from(header) + 1;
             let end = (i + count).min(buffer.len());
-            decoded.extend_from_slice(&buffer[i..end]);
+            let taken = (end - i).min(remaining);
+            decoded.extend_from_slice(&buffer[i..i + taken]);
             i = end;
         }
     }
     decoded
-}
-
-// Helper trait to reborrow Option<&mut T> inside the RLE inner loops without
-// fighting the borrow checker over the per-iteration mutable access.
-trait OptMutHelper {
-    fn as_deref_mut_unchecked(&mut self) -> &mut DecodeTarget;
-}
-impl OptMutHelper for Option<&mut DecodeTarget> {
-    #[inline]
-    fn as_deref_mut_unchecked(&mut self) -> &mut DecodeTarget {
-        self.as_deref_mut().expect("pixel_data present in RLE write path")
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2536,7 +2684,15 @@ fn read_image_data(reader: &mut PsdReader, psd: &crate::psd::Psd) -> ReadResult<
     let height = psd.height as usize;
     let channels_count = psd.channels.unwrap_or(0.0) as usize;
 
-    if compression != Compression::RawData && compression != Compression::RleCompressed {
+    // ZIP composites only exist for the RGB/Grayscale branch below; the other
+    // colour modes reject them there, with the same wording.
+    if !matches!(
+        compression,
+        Compression::RawData
+            | Compression::RleCompressed
+            | Compression::ZipWithoutPrediction
+            | Compression::ZipWithPrediction
+    ) {
         return Err(ReadError::StrictViolation(format!(
             "Compression type not supported: {}",
             compression_code(compression)
@@ -2633,7 +2789,35 @@ fn read_image_data(reader: &mut PsdReader, psd: &crate::psd::Psd) -> ReadResult<
                     )?;
                 }
                 Compression::ZipWithoutPrediction | Compression::ZipWithPrediction => {
-                    return Err(compression_not_supported(compression))
+                    // The composite section stores ZIP channels back to back
+                    // with no length table, so each stream's length has to be
+                    // recovered by decompressing it (`zip_stream_length`).
+                    let prediction = compression == Compression::ZipWithPrediction;
+                    let sample_bytes = crate::helpers::bytes_per_sample(bits_per_channel)
+                        .ok_or_else(|| {
+                            ReadError::StrictViolation(format!(
+                                "Unsupported bit depth for ZIP channel data: {}",
+                                bits_per_channel
+                            ))
+                        })?;
+                    let expected = width
+                        .checked_mul(height)
+                        .and_then(|pixels| pixels.checked_mul(sample_bytes))
+                        .ok_or(ReadError::SizeTooLarge)?;
+                    for &c in &channels {
+                        let consumed = zip_stream_length(reader, expected)?;
+                        let compressed = read_bytes_slice(reader, consumed)?;
+                        read_data_zip(
+                            compressed,
+                            Some(&mut image_data),
+                            width,
+                            height,
+                            bits_per_channel,
+                            4,
+                            c,
+                            prediction,
+                        );
+                    }
                 }
             }
 
@@ -2930,10 +3114,28 @@ pub fn read_pattern(reader: &mut PsdReader) -> ReadResult<PatternInfo> {
         let data_length = length.saturating_sub(4 + 16 + 2 + 1);
         let cdata = read_bytes(reader, data_length)?;
 
-        if pixel_depth != 8 || pixel_depth2 != 8 {
-            return Err(ReadError::StrictViolation(
-                "16bit pixel depth not supported for patterns".to_string(),
-            ));
+        // A pattern channel repeats its depth in both a u32 and a u16 field;
+        // they must agree, and only the three RGB depths are decodable.
+        if u32::from(pixel_depth2) != pixel_depth {
+            return Err(ReadError::StrictViolation(format!(
+                "Pattern channel depth mismatch: {} != {}",
+                pixel_depth, pixel_depth2
+            )));
+        }
+        let channel_sample_bytes =
+            crate::helpers::bytes_per_sample(pixel_depth).ok_or_else(|| {
+                ReadError::StrictViolation(format!(
+                    "Unsupported pixel depth for patterns: {}",
+                    pixel_depth
+                ))
+            })?;
+        // A palette index is a byte, so an indexed pattern is 8-bit by
+        // definition; anything else would index the palette with half a sample.
+        if color_mode == ColorMode::Indexed && pixel_depth != 8 {
+            return Err(ReadError::StrictViolation(format!(
+                "Indexed patterns require 8-bit channels, got {}",
+                pixel_depth
+            )));
         }
 
         // Same treatment as the pattern rectangle: validate first, then derive
@@ -2958,20 +3160,28 @@ pub fn read_pattern(reader: &mut PsdReader) -> ReadResult<PatternInfo> {
             if color_mode == ColorMode::Rgb && ch < 3 {
                 for yy in 0..h {
                     for xx in 0..w {
-                        let src = xx + yy * w;
+                        // Samples are `channel_sample_bytes` wide and
+                        // big-endian; `sample_to_u8` narrows them to RGBA8.
+                        let src = (xx + yy * w) * channel_sample_bytes;
                         let dst = (ox + xx + (yy + oy) * width) * 4;
-                        if dst + ch < data.len() && src < cdata.len() {
-                            data[dst + ch] = cdata[src];
+                        let Some(sample) = cdata.get(src..src + channel_sample_bytes) else {
+                            continue;
+                        };
+                        if dst + ch < data.len() {
+                            data[dst + ch] = sample_to_u8(sample, pixel_depth);
                         }
                     }
                 }
             } else if color_mode == ColorMode::Grayscale && ch < 1 {
                 for yy in 0..h {
                     for xx in 0..w {
-                        let src = xx + yy * w;
+                        let src = (xx + yy * w) * channel_sample_bytes;
                         let dst = (ox + xx + (yy + oy) * width) * 4;
-                        if dst + 2 < data.len() && src < cdata.len() {
-                            let value = cdata[src];
+                        let Some(sample) = cdata.get(src..src + channel_sample_bytes) else {
+                            continue;
+                        };
+                        if dst + 2 < data.len() {
+                            let value = sample_to_u8(sample, pixel_depth);
                             data[dst] = value;
                             data[dst + 1] = value;
                             data[dst + 2] = value;
@@ -3009,11 +3219,11 @@ pub fn read_pattern(reader: &mut PsdReader) -> ReadResult<PatternInfo> {
                 // `createReader` over the channel buffer.
                 let mut cdata_reader = PsdReader::new(&cdata, None, None);
                 if color_mode == ColorMode::Rgb && ch < 3 {
-                    read_data_rle(&mut cdata_reader, Some(&mut temp), w, h, 8, 1, &[0], false)?;
+                    read_data_rle(&mut cdata_reader, Some(&mut temp), w, h, pixel_depth, 1, &[0], false)?;
                     copy_channel_to_rgba(&temp, &mut data, width, ox, oy, ch);
                 }
                 if color_mode == ColorMode::Grayscale && ch < 1 {
-                    read_data_rle(&mut cdata_reader, Some(&mut temp), w, h, 8, 1, &[0], false)?;
+                    read_data_rle(&mut cdata_reader, Some(&mut temp), w, h, pixel_depth, 1, &[0], false)?;
                     copy_channel_to_rgba(&temp, &mut data, width, ox, oy, 0);
                     // setup grayscale on the destination region is approximated by
                     // copying channel 0 into 1 and 2 in copy step below.
@@ -3767,6 +3977,180 @@ mod tests {
         let mut target = DecodeTarget::rgba(2, 1);
         read_data_rle(&mut r2, Some(&mut target), 2, 1, 8, 4, &[0], false).unwrap();
         assert_eq!(r2.total_memory_limit, Some(1000));
+    }
+
+    /// Compresses `data` with zlib framing (what this crate's writer emits).
+    fn zlib_wrap(data: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut e =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    /// Compresses `data` as a bare DEFLATE stream (what some third-party PSD
+    /// writers emit).
+    fn deflate_raw(data: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut e =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    #[test]
+    fn packbits_rows_cannot_amplify_past_the_declared_row() {
+        // Maximum PackBits amplification: every two bytes (`0x81`, value)
+        // decode to 128 identical bytes — 64x. One MiB of these expands to
+        // 64 MiB, for a bitmap that declares four pixels. An unbounded decoder
+        // allocates all of it outside `ReadOptions::total_memory_limit`; a
+        // bounded one stops at the row.
+        const HOSTILE_BYTES: usize = 1 << 20;
+        let hostile: Vec<u8> = std::iter::repeat_n([0x81u8, 0xAB], HOSTILE_BYTES / 2)
+            .flatten()
+            .collect();
+
+        // A 4-pixel, 8-bit row is 4 bytes.
+        const ROW_BYTES: usize = 4;
+        let decoded = decode_packbits_row(&hostile, ROW_BYTES);
+        assert_eq!(decoded, vec![0xAB; ROW_BYTES]);
+        assert!(
+            decoded.capacity() < 1024,
+            "the decode buffer was reserved for the expansion, not the row: {} bytes",
+            decoded.capacity()
+        );
+
+        // The same row through the public reader: PSB row lengths are 4 bytes
+        // wide, which is what lets a single row declare a megabyte.
+        let mut buf = u32::try_from(HOSTILE_BYTES).unwrap().to_be_bytes().to_vec();
+        buf.extend_from_slice(&hostile);
+        let mut r = PsdReader::new(&buf, None, None);
+        r.total_memory_limit = Some(64 * 1024);
+        let mut target = DecodeTarget::rgba(4, 1);
+        read_data_rle(&mut r, Some(&mut target), 4, 1, 8, 4, &[0], true).unwrap();
+        // Only channel 0 was decoded; `DecodeTarget::rgba` starts zeroed.
+        assert_eq!(target.data, vec![0xAB, 0, 0, 0, 0xAB, 0, 0, 0, 0xAB, 0, 0, 0, 0xAB, 0, 0, 0]);
+        assert_eq!(
+            r.total_memory_limit,
+            Some(64 * 1024),
+            "the row-length scratch must be refunded, and nothing else charged"
+        );
+    }
+
+    #[test]
+    fn zip_channels_are_read_under_both_framings() {
+        // Two 8-bit pixels in one channel.
+        let channel = [0x10u8, 0xF0];
+        assert!(has_zlib_header(&zlib_wrap(&channel)));
+        assert!(!has_zlib_header(&deflate_raw(&channel)));
+
+        for compressed in [zlib_wrap(&channel), deflate_raw(&channel)] {
+            let mut target = DecodeTarget::rgba(2, 1);
+            read_data_zip(&compressed, Some(&mut target), 2, 1, 8, 4, 0, false);
+            assert_eq!(target.data[0], 0x10);
+            assert_eq!(target.data[4], 0xF0);
+        }
+
+        // 32-bit float samples, unpredicted, go through the same door.
+        let floats: Vec<u8> =
+            [0.0f32, 1.0].into_iter().flat_map(f32::to_be_bytes).collect();
+        for compressed in [zlib_wrap(&floats), deflate_raw(&floats)] {
+            let mut target = DecodeTarget::rgba(2, 1);
+            read_data_zip(&compressed, Some(&mut target), 2, 1, 32, 4, 0, false);
+            assert_eq!((target.data[0], target.data[4]), (0, 255));
+        }
+
+        // Data that is neither framing is dropped, not panicked on.
+        let mut target = DecodeTarget::rgba(2, 1);
+        read_data_zip(&[0xDE, 0xAD, 0xBE, 0xEF], Some(&mut target), 2, 1, 8, 4, 0, false);
+        assert_eq!(target.data[0], 0);
+    }
+
+    #[test]
+    fn zip_stream_length_accepts_both_framings_and_charges_the_budget() {
+        let channel = [7u8; 64];
+        for compressed in [zlib_wrap(&channel), deflate_raw(&channel)] {
+            // A trailing byte stands in for the next channel: the length must
+            // stop at the end of this stream.
+            let mut buf = compressed.clone();
+            buf.push(0xAB);
+            let mut r = PsdReader::new(&buf, None, None);
+            r.total_memory_limit = Some(1000);
+            assert_eq!(zip_stream_length(&mut r, channel.len()).unwrap(), compressed.len());
+            assert_eq!(r.offset, 0, "the cursor must not move");
+            assert_eq!(r.total_memory_limit, Some(1000), "scratch memory must be refunded");
+        }
+
+        // The scratch buffer is charged, so an insufficient budget is an error
+        // rather than an unaccounted allocation — and the budget survives it.
+        let compressed = zlib_wrap(&channel);
+        let mut r = PsdReader::new(&compressed, None, None);
+        r.total_memory_limit = Some(8);
+        assert_eq!(
+            zip_stream_length(&mut r, channel.len()).unwrap_err(),
+            ReadError::ExceededMemoryLimit { requested: 64, available: 8 }
+        );
+        assert_eq!(r.total_memory_limit, Some(8));
+
+        // Undecodable data is reported, and the budget is still refunded.
+        let junk = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        let mut r = PsdReader::new(&junk, None, None);
+        r.total_memory_limit = Some(1000);
+        assert!(matches!(
+            zip_stream_length(&mut r, 64).unwrap_err(),
+            ReadError::StrictViolation(_)
+        ));
+        assert_eq!(r.total_memory_limit, Some(1000));
+    }
+
+    #[test]
+    fn composite_zip_channels_are_read_back() {
+        use crate::psd::{ColorMode, PixelData, Psd, WriteOptions};
+        use crate::writer::write_psd;
+
+        // Write an ordinary 8-bit document, then replace its composite section
+        // with the ZIP form. Photoshop never emits one (upstream
+        // `psdWriter.ts:314` says so and this crate follows), but third-party
+        // writers do, and the reader must not reject those files.
+        let pixels = PixelData {
+            width: 2,
+            height: 1,
+            data: vec![0x11, 0x22, 0x33, 255, 0x44, 0x55, 0x66, 255],
+        };
+        let psd = Psd {
+            width: 2.0,
+            height: 1.0,
+            color_mode: Some(ColorMode::Rgb),
+            image_data: Some(pixels.clone()),
+            ..Default::default()
+        };
+        let bytes = write_psd(&psd, &WriteOptions::default());
+
+        // Header, then three length-prefixed sections; the composite follows.
+        let section_len = |at: usize, buf: &[u8]| -> usize {
+            u32::from_be_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]) as usize
+        };
+        let mut at = 26usize;
+        for _ in 0..3 {
+            at += 4 + section_len(at, &bytes);
+        }
+
+        for wrap in [zlib_wrap as fn(&[u8]) -> Vec<u8>, deflate_raw] {
+            let mut patched = bytes[..at].to_vec();
+            patched.extend_from_slice(&(Compression::ZipWithoutPrediction as u16).to_be_bytes());
+            for channel in 0..3usize {
+                let plane: Vec<u8> =
+                    (0..2usize).map(|x| pixels.data[x * 4 + channel]).collect();
+                patched.extend_from_slice(&wrap(&plane));
+            }
+
+            let again = read_psd(
+                &patched,
+                &ReadOptions { use_image_data: Some(true), ..Default::default() },
+            )
+            .expect("composite ZIP channels must be readable");
+            assert_eq!(again.image_data.as_ref().expect("composite").data, pixels.data);
+        }
     }
 
     #[test]

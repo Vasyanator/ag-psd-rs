@@ -64,7 +64,9 @@ One key pair escapes that contract: `Lr16`/`Lr32` carry a full nested layer-info
 block (the layers of a 16/32-bit document), so `reader::read_additional_layer_info`
 handles them itself — a group module only sees a `LayerAdditionalInfo`, and this
 needs the whole `Psd`. Errors from that nested read propagate instead of being
-swallowed like other handler errors.
+swallowed like other handler errors. The write side is the mirror image:
+`writer::write_high_depth_layer_info` emits the block from the flattened layer
+list, and the `misc_keys` write predicate for both keys stays `false`.
 
 ## Contracts and invariants
 
@@ -84,6 +86,13 @@ swallowed like other handler errors.
   are charged (and kept, so never refunded) inside `reader::read_pattern`, the
   crate's single pattern implementation, which also runs the same
   `check_box_size` validation as layers and masks.
+- **Channel bit depth.** The model is RGBA8 everywhere; the file is not. The
+  reader narrows 16/32-bit samples to bytes through `reader::sample_to_u8`, and
+  the writer widens them through `helpers::expand_channel_samples` (16-bit is
+  `sample * 257`, 32-bit is `sample / 255.0` as a big-endian `f32`). Inside
+  `writer.rs` the depth travels as the private `BitDepth` enum, so no encode
+  decision depends on a float comparison or a lossy cast. The `Layer::raw_data`
+  verbatim path is used only when the stored depth equals the document's.
 - **Writer buffer semantics.** `write_data_rle` mirrors upstream's typed-array
   behaviour: out-of-range writes are dropped rather than reported. The shared RLE
   scratch buffer must therefore be sized by `rle_scratch_size` for the widest
@@ -111,7 +120,8 @@ swallowed like other handler errors.
 - To change the read pipeline, bitmap decoding, the memory budget or rectangle
   validation, see `reader.rs`.
 - To change channel encoding, layer records or the scratch-buffer sizing, see
-  `writer.rs`.
+  `writer.rs`; bit-depth expansion and PackBits/ZIP compression live in
+  `helpers.rs`.
 - To change the public surface or the crate-level docs, see `lib.rs`.
 - To change descriptor enum decoding, see `helpers.rs` (`EnumCodec`) and
   `descriptor.rs`.

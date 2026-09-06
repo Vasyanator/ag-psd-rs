@@ -26,7 +26,24 @@ Notes:
   `write_pattern` encodes into its own local buffer, and the `Layer::raw_data`
   verbatim path does not encode at all.
 - `get_channels` has a verbatim fast path for `Layer::raw_data` (channels read
-  with `ReadOptions::use_raw_data`): they are written back without decoding.
+  with `ReadOptions::use_raw_data`): they are written back without decoding,
+  but only when the stored depth equals the document's — the bytes are laid out
+  for the depth they were read at.
+- Bit depth is carried through the encode path as the private `BitDepth` enum
+  rather than the model's `Option<f64>`, so every depth-driven decision is an
+  exhaustive match and no lossy float-to-integer cast is needed. 8-bit documents
+  keep their layer records in the ordinary layer-info section; 16- and 32-bit
+  documents leave that section empty and put the same body into a document-level
+  `Lr16`/`Lr32` tagged block (`write_high_depth_layer_info`), which is what
+  Photoshop reads.
+- The composite is always PackBits, whatever `WriteOptions::compress` says —
+  upstream `psdWriter.ts:314`: "Photoshop doesn't support zip compression of
+  composite image data". ZIP applies to layer and mask channels only, and is
+  always zlib-wrapped (upstream uses pako's `deflate`).
+- `add_children` and `get_largest_layer_size` walk the layer tree with an
+  explicit stack, not recursion: the tree comes from a caller-supplied document
+  and may nest arbitrarily deep. `clone_without_children` keeps the closing
+  folder record from deep-copying the subtree it discards.
 */
 
 // PORT STATUS: primitives ported; document orchestration ported.
@@ -35,8 +52,8 @@ use crate::additional_info::{write_additional_info, WriteCtx};
 use crate::helpers::{
     clamp, from_blend_mode, has_alpha, offset_for_channel, write_data_rle,
     write_data_rle_bit_depth, write_data_zip_without_prediction_bit_depth,
-    Bounds as ChannelBounds, ChannelData,
-    ColorSpace, LayerChannelData, LayerMaskFlags, MaskParams, RAW_IMAGE_DATA,
+    Bounds as ChannelBounds, ChannelData, ColorSpace, LayerChannelData, LayerMaskFlags,
+    MaskParams, RleEncodeError, RAW_IMAGE_DATA,
 };
 use crate::image_resources::{has_image_resource, write_image_resource, RESOURCE_IDS};
 use crate::psd::{
@@ -44,6 +61,145 @@ use crate::psd::{
     LayerAdditionalInfo, LayerMaskData, PatternInfo, PixelData, Psd, SectionDividerType,
     WriteOptions,
 };
+
+/// Channel bit depth of the document being written.
+///
+/// The writer emits RGB documents at the three depths Photoshop uses; keeping
+/// them as an enum instead of the model's `Option<f64>` removes every lossy
+/// float-to-integer conversion from the encode path and makes each depth-driven
+/// `match` exhaustive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BitDepth {
+    /// 8 bits per channel: one byte per sample.
+    Eight,
+    /// 16 bits per channel: one big-endian `u16` per sample.
+    Sixteen,
+    /// 32 bits per channel: one big-endian `f32` per sample, in `0.0..=1.0`.
+    ThirtyTwo,
+}
+
+impl BitDepth {
+    /// Maps `Psd::bits_per_channel` (`None` meaning 8) onto a writable depth.
+    ///
+    /// Returns `None` for every other value, including non-integral ones; the
+    /// caller rejects the document, since the write path cannot report an error
+    /// (see the crate contract in `MODULE_README.md`).
+    fn from_psd(bits_per_channel: Option<f64>) -> Option<BitDepth> {
+        match bits_per_channel.unwrap_or(8.0) {
+            8.0 => Some(BitDepth::Eight),
+            16.0 => Some(BitDepth::Sixteen),
+            32.0 => Some(BitDepth::ThirtyTwo),
+            _ => None,
+        }
+    }
+
+    /// The depth in bits, as the PSD header and the model store it.
+    const fn bits(self) -> u32 {
+        match self {
+            BitDepth::Eight => 8,
+            BitDepth::Sixteen => 16,
+            BitDepth::ThirtyTwo => 32,
+        }
+    }
+
+    /// The depth in bits as a `u16`, the width of the header field.
+    const fn header_bits(self) -> u16 {
+        match self {
+            BitDepth::Eight => 8,
+            BitDepth::Sixteen => 16,
+            BitDepth::ThirtyTwo => 32,
+        }
+    }
+
+    /// Bytes one sample occupies in the file.
+    const fn bytes_per_sample(self) -> usize {
+        match self {
+            BitDepth::Eight => 1,
+            BitDepth::Sixteen => 2,
+            BitDepth::ThirtyTwo => 4,
+        }
+    }
+
+    /// Whether layer records must go into a document-level `Lr16`/`Lr32` block
+    /// instead of the ordinary layer-info section.
+    const fn is_high_depth(self) -> bool {
+        !matches!(self, BitDepth::Eight)
+    }
+}
+
+/// Encodes the channels at `offsets` of one bitmap with `compression`.
+///
+/// `offsets` are byte indices inside each RGBA quadruple (`0..=3`), and
+/// `temp_buffer` is the shared RLE scratch buffer (used only for the 8-bit RLE
+/// path — see `helpers::write_data_rle_bit_depth`). Returns the encoded bytes
+/// exactly as they go into the file.
+///
+/// # Panics
+/// The write path is infallible by design (`MODULE_README.md`), so input the
+/// PSD container cannot represent panics here with the encoder's own
+/// diagnostic rather than silently producing a shorter, corrupt channel. Every
+/// such case is a caller contract violation: an unsupported depth, a bitmap
+/// whose buffer is shorter than its declared size, or a row too wide for a PSD
+/// row-length entry (the message says to use PSB).
+fn encode_channel(
+    temp_buffer: &mut [u8],
+    data: &PixelData,
+    offsets: &[usize],
+    compression: Compression,
+    psb: bool,
+    bit_depth: BitDepth,
+) -> Vec<u8> {
+    match compression {
+        Compression::RleCompressed => {
+            match write_data_rle_bit_depth(temp_buffer, data, offsets, psb, bit_depth.bits()) {
+                Ok(encoded) => encoded,
+                Err(e) => panic!(
+                    "Cannot RLE-encode a {}x{} channel at {} bits: {}",
+                    data.width,
+                    data.height,
+                    bit_depth.bits(),
+                    e
+                ),
+            }
+        }
+        Compression::ZipWithoutPrediction => {
+            write_data_zip_without_prediction_bit_depth(data, offsets, bit_depth.bits())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Cannot ZIP-encode a {}x{} channel at {} bits: {}",
+                        data.width,
+                        data.height,
+                        bit_depth.bits(),
+                        RleEncodeError::InvalidBitmap {
+                            width: data.width as usize,
+                            height: data.height as usize,
+                            channels: offsets.len(),
+                            data_len: data.data.len(),
+                        }
+                    )
+                })
+        }
+        // The writer never selects these: raw channels are only re-emitted
+        // through the `Layer::raw_data` verbatim path, which does not encode,
+        // and prediction has no encoder here.
+        Compression::RawData | Compression::ZipWithPrediction => panic!(
+            "Compression {:?} is not produced by this writer",
+            compression
+        ),
+    }
+}
+
+/// The channel compression this writer emits, selected by `WriteOptions`.
+///
+/// `compress = Some(true)` selects ZIP without prediction (upstream's only
+/// alternative); everything else selects PackBits RLE.
+const fn selected_compression(options: &WriteOptions) -> Compression {
+    if matches!(options.compress, Some(true)) {
+        Compression::ZipWithoutPrediction
+    } else {
+        Compression::RleCompressed
+    }
+}
 
 /// Порт TS-интерфейса `PsdWriter`.
 ///
@@ -477,7 +633,9 @@ pub fn write_pattern(writer: &mut PsdWriter, pattern: &PatternInfo) {
         // bound for tall, narrow channels (the `2 * width + 16` slack does not
         // cover the ~`height / 128` run headers) and overflows `u32` on large
         // patterns; `rle_scratch_size` is a proven bound in saturating usize.
-        let mut buffer = vec![0u8; rle_scratch_size(width, height, 1, false, 8)];
+        // Pattern channels are 8-bit whatever the document depth: the pattern
+        // record carries its own per-channel depth and this writer emits 8.
+        let mut buffer = vec![0u8; rle_scratch_size(width, height, 1, false, BitDepth::Eight)];
         let data = write_data_rle(&mut buffer, &pixel_data, &[offset as usize], false)
             .expect("write_data_rle returned None for pattern channel");
 
@@ -544,22 +702,17 @@ fn rle_scratch_size(
     height: u32,
     channel_count: usize,
     large: bool,
-    bits_per_channel: u32,
+    bit_depth: BitDepth,
 ) -> usize {
     // u32 -> usize is a widening conversion on both supported targets
     // (x86_64-unknown-linux-gnu / x86_64-pc-windows-gnu), so nothing is lost.
     let w = width as usize;
     let h = height as usize;
     let table = h.saturating_mul(rle_row_length_entry_size(large));
-    let bytes_per_sample = match bits_per_channel {
-        16 => 2,
-        32 => 4,
-        _ => 1,
-    };
     let data = 2usize
         .saturating_mul(w)
         .saturating_mul(h)
-        .saturating_mul(bytes_per_sample);
+        .saturating_mul(bit_depth.bytes_per_sample());
     table.saturating_add(data).saturating_mul(channel_count)
 }
 
@@ -570,33 +723,40 @@ fn rle_scratch_size(
 /// own — together with its `mask` and `real_mask`, because those are encoded
 /// through the same shared scratch buffer and may be larger than the layer.
 /// `large` is the PSB flag of the document being written; it selects the width
-/// of the per-row length table entries (see `rle_scratch_size`).
-fn get_largest_layer_size(layers: Option<&[Layer]>, large: bool, bits_per_channel: u32) -> usize {
-    let mut max = 0usize;
-    let layers = match layers {
-        Some(l) => l,
+/// of the per-row length table entries, and `bit_depth` the sample width, both
+/// per `rle_scratch_size`. The tree is walked iteratively, so a deeply nested
+/// group hierarchy cannot overflow the stack.
+fn get_largest_layer_size(layers: Option<&[Layer]>, large: bool, bit_depth: BitDepth) -> usize {
+    let roots = match layers {
+        Some(roots) => roots,
         None => return 0,
     };
-    for layer in layers {
+
+    // Walked with an explicit stack rather than by recursion: the layer tree
+    // comes from a caller-supplied document and can nest arbitrarily deep, and
+    // a maximum is order-independent, so the pop order does not matter.
+    let mut max = 0usize;
+    let mut pending: Vec<&Layer> = roots.iter().collect();
+    while let Some(layer) = pending.pop() {
         let (width, height) =
             get_layer_dimensions(layer.canvas.as_ref(), layer.image_data.as_ref());
         // Layer bitmaps and masks are encoded one channel at a time
         // (`get_layer_channels` / `get_mask_channels` pass a single offset).
-        max = max.max(rle_scratch_size(width, height, 1, large, bits_per_channel));
+        max = max.max(rle_scratch_size(width, height, 1, large, bit_depth));
 
         if let Some(mask) = &layer.additional_info.mask {
             let (width, height) = get_layer_dimensions(mask.canvas.as_ref(), mask.image_data.as_ref());
-            max = max.max(rle_scratch_size(width, height, 1, large, bits_per_channel));
+            max = max.max(rle_scratch_size(width, height, 1, large, bit_depth));
         }
 
         if let Some(real_mask) = &layer.additional_info.real_mask {
             let (width, height) =
                 get_layer_dimensions(real_mask.canvas.as_ref(), real_mask.image_data.as_ref());
-            max = max.max(rle_scratch_size(width, height, 1, large, bits_per_channel));
+            max = max.max(rle_scratch_size(width, height, 1, large, bit_depth));
         }
 
         if let Some(children) = &layer.children {
-            max = max.max(get_largest_layer_size(Some(children), large, bits_per_channel));
+            pending.extend(children.iter());
         }
     }
     max
@@ -641,10 +801,13 @@ pub fn write_psd_to_writer(writer: &mut PsdWriter, psd: &Psd, options: &WriteOpt
         panic!("Document size is too large (max is 30000x30000, use PSB format instead)");
     }
 
-    let bits_per_channel = psd.bits_per_channel.unwrap_or(8.0);
-    if !matches!(bits_per_channel, 8.0 | 16.0 | 32.0) {
-        panic!("bitsPerChannel must be 8, 16, or 32 for writing");
-    }
+    let bit_depth = match BitDepth::from_psd(psd.bits_per_channel) {
+        Some(depth) => depth,
+        None => panic!(
+            "bitsPerChannel must be 8, 16, or 32 for writing (document declares {:?})",
+            psd.bits_per_channel
+        ),
+    };
 
     verify_bit_count(psd.children.as_deref());
 
@@ -672,19 +835,22 @@ pub fn write_psd_to_writer(writer: &mut PsdWriter, psd: &Psd, options: &WriteOpt
     // upstream's estimate charges only once. Size for 4 channels
     // unconditionally: it is the maximum the composite writer can ask for.
     const COMPOSITE_MAX_CHANNELS: usize = 4;
+    // The shared scratch buffer is only ever written by the 8-bit PackBits
+    // encoder. `helpers::write_data_rle_bit_depth` allocates its own exactly
+    // sized output for 16- and 32-bit channels and does not touch this buffer,
+    // and the ZIP encoders never take one at all — so sizing it for the
+    // document's depth would reserve 2x (16-bit) or 4x (32-bit) more than
+    // anything can use. `SCRATCH_DEPTH` is the depth that actually writes here.
+    const SCRATCH_DEPTH: BitDepth = BitDepth::Eight;
     let composite_size = rle_scratch_size(
         psd.width as u32,
         psd.height as u32,
         COMPOSITE_MAX_CHANNELS,
         psb,
-        bits_per_channel as u32,
+        SCRATCH_DEPTH,
     );
-    let max_buffer_size = get_largest_layer_size(
-        psd.children.as_deref(),
-        psb,
-        bits_per_channel as u32,
-    )
-    .max(composite_size);
+    let max_buffer_size =
+        get_largest_layer_size(psd.children.as_deref(), psb, SCRATCH_DEPTH).max(composite_size);
     writer.temp_buffer = Some(vec![0u8; max_buffer_size]);
 
     // header
@@ -694,7 +860,7 @@ pub fn write_psd_to_writer(writer: &mut PsdWriter, psd: &Psd, options: &WriteOpt
     write_uint16(writer, if global_alpha { 4 } else { 3 }); // channels
     write_uint32(writer, psd.height as u32);
     write_uint32(writer, psd.width as u32);
-    write_uint16(writer, bits_per_channel as u16);
+    write_uint16(writer, bit_depth.header_bits());
     write_uint16(writer, ColorMode::Rgb as u16); // we only support saving RGB
 
     // color mode data
@@ -779,8 +945,22 @@ pub fn write_psd_to_writer(writer: &mut PsdWriter, psd: &Psd, options: &WriteOpt
         writer,
         2,
         |w| {
-            write_layer_info(w, &layers, psd, global_alpha, options, psb);
+            if bit_depth.is_high_depth() {
+                // Photoshop keeps 16/32-bit layer records in a document-level
+                // Lr16/Lr32 tagged block and leaves the ordinary layer-info
+                // section empty (a bare zero length). The block below carries
+                // the same flattened layer list, so the model stays
+                // single-sourced.
+                write_section(w, 4, |_| {}, true, psb);
+            } else {
+                write_layer_info(w, &layers, global_alpha, options, psb, bit_depth);
+            }
             write_global_layer_mask_info(w, psd.global_layer_mask_info.as_ref());
+
+            if bit_depth.is_high_depth() {
+                write_high_depth_layer_info(w, &layers, global_alpha, options, psb, bit_depth);
+            }
+
             // document-level additional layer info
             let mut ctx = WriteCtx::new(options, psb);
             write_additional_info(w, &psd.additional_info, &mut ctx);
@@ -803,7 +983,11 @@ pub fn write_psd_to_writer(writer: &mut PsdWriter, psd: &Psd, options: &WriteOpt
         data: vec![0u8; (width as usize) * (height as usize) * 4],
     };
 
-    write_uint16(writer, Compression::RleCompressed as u16);
+    // Upstream `psdWriter.ts:314`: "Photoshop doesn't support zip compression
+    // of composite image data". The composite is therefore always PackBits,
+    // whatever `WriteOptions::compress` selects for the layer channels.
+    let compression = Compression::RleCompressed;
+    write_uint16(writer, compression as u16);
 
     if let Some(id) = image_data {
         data.data[..id.data.len()].copy_from_slice(&id.data);
@@ -828,15 +1012,9 @@ pub fn write_psd_to_writer(writer: &mut PsdWriter, psd: &Psd, options: &WriteOpt
     }
 
     let mut temp = writer.temp_buffer.take().unwrap();
-    let rle = write_data_rle_bit_depth(
-        &mut temp,
-        &data,
-        &channels,
-        psb,
-        bits_per_channel as u32,
-    );
+    let encoded = encode_channel(&mut temp, &data, &channels, compression, psb, bit_depth);
     writer.temp_buffer = Some(temp);
-    write_bytes(writer, rle.as_deref());
+    write_bytes(writer, Some(&encoded));
 }
 
 /// Записать один байт палитры (0 при отсутствии цвета).
@@ -845,112 +1023,172 @@ fn w_palette_byte(writer: &mut PsdWriter, value: Option<f64>) {
 }
 
 /// Порт `writeLayerInfo(writer, layers, psd, globalAlpha, options)`.
+///
+/// Divergence: upstream's `psd` argument is not taken — the only thing it was
+/// read for is the channel bit depth, which arrives typed as `bit_depth`.
+///
+/// Emits the 8-bit layer-info section: a length prefix followed by the body
+/// `write_layer_info_body` produces. 16/32-bit documents keep the same body but
+/// in a document-level tagged block instead — see `write_high_depth_layer_info`.
 fn write_layer_info(
     writer: &mut PsdWriter,
     layers: &[Layer],
-    psd: &Psd,
     global_alpha: bool,
     options: &WriteOptions,
     psb: bool,
+    bit_depth: BitDepth,
 ) {
     write_section(
         writer,
         4,
-        |w| {
-            write_int16(
-                w,
-                if global_alpha {
-                    -(layers.len() as i16)
-                } else {
-                    layers.len() as i16
-                },
-            );
-
-            // extract channels for every layer
-            let mut temp = w.temp_buffer.take().unwrap();
-            let mut layers_data: Vec<LayerChannelData> = layers
-                .iter()
-                .enumerate()
-                .map(|(i, l)| {
-                    get_channels(&mut temp, l, i == 0, options, psb, psd.bits_per_channel)
-                })
-                .collect();
-            w.temp_buffer = Some(temp);
-
-            // layer records
-            let mut ctx = WriteCtx::new(options, psb);
-            for layer_data in &layers_data {
-                let layer = &layer_data.layer;
-                write_int32(w, layer_data.top);
-                write_int32(w, layer_data.left);
-                write_int32(w, layer_data.bottom);
-                write_int32(w, layer_data.right);
-                write_uint16(w, layer_data.channels.len() as u16);
-
-                for c in &layer_data.channels {
-                    write_int16(w, c.id as i16);
-                    if psb {
-                        write_uint32(w, 0);
-                    }
-                    write_uint32(w, c.length as u32);
-                }
-
-                write_signature(w, "8BIM");
-                // Mirror `fromBlendMode[layer.blendMode!] || 'norm'`: descriptor-only
-                // modes have no legacy signature and fall back to 'norm'.
-                let blend = layer.blend_mode.and_then(from_blend_mode).unwrap_or("norm");
-                write_signature(w, blend);
-                write_uint8(w, (clamp(layer.opacity.unwrap_or(1.0), 0.0, 1.0) * 255.0).round() as u8);
-                write_uint8(w, if layer.clipping == Some(true) { 1 } else { 0 });
-
-                let mut flags: u8 = 0x08;
-                if layer.transparency_protected == Some(true) {
-                    flags |= 0x01;
-                }
-                if layer.hidden == Some(true) {
-                    flags |= 0x02;
-                }
-                let info = &layer.additional_info;
-                let section_irrelevant = info.section_divider.as_ref().is_some_and(|sd| {
-                    sd.divider_type != SectionDividerType::Other
-                });
-                if info.vector_mask.is_some() || section_irrelevant || info.adjustment.is_some() {
-                    flags |= 0x10;
-                }
-                if layer.effects_open == Some(true) {
-                    flags |= 0x20;
-                }
-
-                write_uint8(w, flags);
-                write_uint8(w, 0); // filler
-
-                write_section(
-                    w,
-                    1,
-                    |w| {
-                        write_layer_mask_data(w, info, layer_data);
-                        write_layer_blending_ranges(w, info);
-                        let name = info.name.clone().unwrap_or_default();
-                        let name: String = name.chars().take(255).collect();
-                        write_pascal_string(w, &name, 4);
-                        write_additional_info(w, info, &mut ctx);
-                    },
-                    false,
-                    false,
-                );
-            }
-
-            // layer channel image data
-            for layer_data in &mut layers_data {
-                for channel in &layer_data.channels {
-                    write_uint16(w, channel.compression as u16);
-                    if let Some(buffer) = &channel.data {
-                        write_bytes(w, Some(buffer));
-                    }
-                }
-            }
-        },
+        |w| write_layer_info_body(w, layers, global_alpha, options, psb, bit_depth),
         true,
+        psb,
+    );
+}
+
+/// Writes the layer-info payload — layer count, layer records and channel image
+/// data — without any enclosing length prefix.
+///
+/// Split out of `write_layer_info` because the `Lr16`/`Lr32` tagged blocks use
+/// their own tagged-block length as the enclosing one: nesting a second
+/// layer-info section inside them would make Photoshop read the layer count
+/// from four bytes of length.
+///
+/// `layers` is the already flattened list (`add_children`), `global_alpha`
+/// encodes the layer count as negative when the composite has alpha, and
+/// `bit_depth` selects the channel sample width.
+fn write_layer_info_body(
+    w: &mut PsdWriter,
+    layers: &[Layer],
+    global_alpha: bool,
+    options: &WriteOptions,
+    psb: bool,
+    bit_depth: BitDepth,
+) {
+    write_int16(
+        w,
+        if global_alpha {
+            -(layers.len() as i16)
+        } else {
+            layers.len() as i16
+        },
+    );
+
+    // extract channels for every layer
+    let mut temp = w.temp_buffer.take().unwrap();
+    let mut layers_data: Vec<LayerChannelData> = layers
+        .iter()
+        .enumerate()
+        .map(|(i, l)| get_channels(&mut temp, l, i == 0, options, psb, bit_depth))
+        .collect();
+    w.temp_buffer = Some(temp);
+
+    // layer records
+    let mut ctx = WriteCtx::new(options, psb);
+    for layer_data in &layers_data {
+        let layer = &layer_data.layer;
+        write_int32(w, layer_data.top);
+        write_int32(w, layer_data.left);
+        write_int32(w, layer_data.bottom);
+        write_int32(w, layer_data.right);
+        write_uint16(w, layer_data.channels.len() as u16);
+
+        for c in &layer_data.channels {
+            write_int16(w, c.id as i16);
+            if psb {
+                write_uint32(w, 0);
+            }
+            write_uint32(w, c.length as u32);
+        }
+
+        write_signature(w, "8BIM");
+        // Mirror `fromBlendMode[layer.blendMode!] || 'norm'`: descriptor-only
+        // modes have no legacy signature and fall back to 'norm'.
+        let blend = layer.blend_mode.and_then(from_blend_mode).unwrap_or("norm");
+        write_signature(w, blend);
+        write_uint8(w, (clamp(layer.opacity.unwrap_or(1.0), 0.0, 1.0) * 255.0).round() as u8);
+        write_uint8(w, if layer.clipping == Some(true) { 1 } else { 0 });
+
+        let mut flags: u8 = 0x08;
+        if layer.transparency_protected == Some(true) {
+            flags |= 0x01;
+        }
+        if layer.hidden == Some(true) {
+            flags |= 0x02;
+        }
+        let info = &layer.additional_info;
+        let section_irrelevant = info.section_divider.as_ref().is_some_and(|sd| {
+            sd.divider_type != SectionDividerType::Other
+        });
+        if info.vector_mask.is_some() || section_irrelevant || info.adjustment.is_some() {
+            flags |= 0x10;
+        }
+        if layer.effects_open == Some(true) {
+            flags |= 0x20;
+        }
+
+        write_uint8(w, flags);
+        write_uint8(w, 0); // filler
+
+        write_section(
+            w,
+            1,
+            |w| {
+                write_layer_mask_data(w, info, layer_data);
+                write_layer_blending_ranges(w, info);
+                let name = info.name.clone().unwrap_or_default();
+                let name: String = name.chars().take(255).collect();
+                write_pascal_string(w, &name, 4);
+                write_additional_info(w, info, &mut ctx);
+            },
+            false,
+            false,
+        );
+    }
+
+    // layer channel image data
+    for layer_data in &mut layers_data {
+        for channel in &layer_data.channels {
+            write_uint16(w, channel.compression as u16);
+            if let Some(buffer) = &channel.data {
+                write_bytes(w, Some(buffer));
+            }
+        }
+    }
+}
+
+/// Writes the document-level `Lr16`/`Lr32` tagged block holding the layer
+/// records of a 16- or 32-bit document.
+///
+/// The key is picked from `bit_depth`, and the signature is `8B64` on PSB (the
+/// long-length form Photoshop uses for the keys that carry one) and `8BIM`
+/// otherwise. The block's own section length encloses the layer-info body, so
+/// `write_layer_info_body` is called without a further length prefix.
+///
+/// This has no upstream counterpart: upstream ag-psd writes 8-bit documents
+/// only, and its `Lr16`/`Lr32` write predicate is `() => false`.
+fn write_high_depth_layer_info(
+    writer: &mut PsdWriter,
+    layers: &[Layer],
+    global_alpha: bool,
+    options: &WriteOptions,
+    psb: bool,
+    bit_depth: BitDepth,
+) {
+    let key = match bit_depth {
+        // Never reached: the caller only invokes this for a high depth.
+        BitDepth::Eight => return,
+        BitDepth::Sixteen => "Lr16",
+        BitDepth::ThirtyTwo => "Lr32",
+    };
+    write_signature(writer, if psb { "8B64" } else { "8BIM" });
+    write_signature(writer, key);
+    write_section(
+        writer,
+        2,
+        |w| write_layer_info_body(w, layers, global_alpha, options, psb, bit_depth),
+        false,
         psb,
     );
 }
@@ -1111,13 +1349,62 @@ fn write_global_layer_mask_info(writer: &mut PsdWriter, info: Option<&GlobalLaye
 }
 
 /// Порт `addChildren(layers, children)`.
+///
+/// Flattens the nested public layer tree into the linear list a PSD layer
+/// section stores: a group becomes a bounding section divider, then its
+/// children, then a closing folder record carrying the group's own properties.
+///
+/// Divergence from upstream: the walk uses an explicit stack instead of
+/// recursion. The tree comes from a caller-supplied document and can nest
+/// arbitrarily deep, and blowing the call stack on user data is not an
+/// acceptable failure mode. Emission order is identical to the recursive form —
+/// children are pushed in reverse so they pop back in document order, and the
+/// closing record is pushed before them so it pops last.
 fn add_children(layers: &mut Vec<Layer>, children: Option<&[Layer]>) {
-    let children = match children {
-        Some(c) => c,
+    /// One step of the flattening walk.
+    enum Task<'a> {
+        /// Emit this layer, descending into it if it is a group.
+        Visit(&'a Layer),
+        /// Emit the closing folder record of a group whose children are done.
+        CloseFolder(&'a Layer),
+    }
+
+    let roots = match children {
+        Some(roots) => roots,
         None => return,
     };
 
-    for c in children {
+    let mut pending: Vec<Task<'_>> = roots.iter().rev().map(Task::Visit).collect();
+    while let Some(task) = pending.pop() {
+        let c = match task {
+            Task::Visit(layer) => layer,
+            Task::CloseFolder(group) => {
+                // closing folder layer: copy of the group with adjusted blend
+                // mode + divider
+                let mut folder = clone_without_children(group);
+                if folder.blend_mode == Some(BlendMode::PassThrough) {
+                    folder.blend_mode = Some(BlendMode::Normal);
+                }
+                // Mirror `fromBlendMode[c.blendMode!] || 'pass'`.
+                let key = group
+                    .blend_mode
+                    .and_then(from_blend_mode)
+                    .unwrap_or("pass")
+                    .to_string();
+                folder.additional_info.section_divider = Some(crate::psd::SectionDivider {
+                    divider_type: if group.opened == Some(false) {
+                        SectionDividerType::ClosedFolder
+                    } else {
+                        SectionDividerType::OpenFolder
+                    },
+                    key: Some(key),
+                    sub_type: Some(0.0),
+                });
+                layers.push(folder);
+                continue;
+            }
+        };
+
         if c.children.is_some() && c.canvas.is_some() {
             panic!("Invalid layer, cannot have both 'canvas' and 'children' properties");
         }
@@ -1125,44 +1412,77 @@ fn add_children(layers: &mut Vec<Layer>, children: Option<&[Layer]>) {
             panic!("Invalid layer, cannot have both 'imageData' and 'children' properties");
         }
 
-        if c.children.is_some() {
-            // bounding section divider
-            let mut open_layer = Layer::default();
-            open_layer.additional_info.name = Some("</Layer group>".to_string());
-            open_layer.additional_info.section_divider = Some(crate::psd::SectionDivider {
-                divider_type: SectionDividerType::BoundingSectionDivider,
-                key: None,
-                sub_type: None,
-            });
-            layers.push(open_layer);
+        match c.children.as_deref() {
+            Some(group_children) => {
+                // bounding section divider
+                let mut open_layer = Layer::default();
+                open_layer.additional_info.name = Some("</Layer group>".to_string());
+                open_layer.additional_info.section_divider = Some(crate::psd::SectionDivider {
+                    divider_type: SectionDividerType::BoundingSectionDivider,
+                    key: None,
+                    sub_type: None,
+                });
+                layers.push(open_layer);
 
-            add_children(layers, c.children.as_deref());
-
-            // closing folder layer: copy of `c` with adjusted blend mode + divider
-            let mut folder = c.clone();
-            folder.children = None;
-            if folder.blend_mode == Some(BlendMode::PassThrough) {
-                folder.blend_mode = Some(BlendMode::Normal);
+                pending.push(Task::CloseFolder(c));
+                pending.extend(group_children.iter().rev().map(Task::Visit));
             }
-            // Mirror `fromBlendMode[c.blendMode!] || 'pass'`.
-            let key = c
-                .blend_mode
-                .and_then(from_blend_mode)
-                .unwrap_or("pass")
-                .to_string();
-            folder.additional_info.section_divider = Some(crate::psd::SectionDivider {
-                divider_type: if c.opened == Some(false) {
-                    SectionDividerType::ClosedFolder
-                } else {
-                    SectionDividerType::OpenFolder
-                },
-                key: Some(key),
-                sub_type: Some(0.0),
-            });
-            layers.push(folder);
-        } else {
-            layers.push(c.clone());
+            None => layers.push(c.clone()),
         }
+    }
+}
+
+/// Clones `layer` with an empty `children`, without copying its subtree.
+///
+/// `Layer`'s derived `Clone` is recursive, so `layer.clone()` on a group copies
+/// the whole subtree that the closing folder record throws away one line later:
+/// quadratic work on a nested document and a second source of stack recursion,
+/// which is exactly what `add_children`'s explicit stack exists to remove.
+///
+/// The destructuring below is exhaustive on purpose — no `..` rest pattern — so
+/// that adding a field to `Layer` fails to compile here instead of silently
+/// dropping that field from every group record.
+fn clone_without_children(layer: &Layer) -> Layer {
+    let Layer {
+        additional_info,
+        top,
+        left,
+        bottom,
+        right,
+        blend_mode,
+        opacity,
+        transparency_protected,
+        effects_open,
+        hidden,
+        clipping,
+        canvas,
+        image_data,
+        raw_data,
+        children: _,
+        opened,
+        link_group,
+        link_group_enabled,
+    } = layer;
+
+    Layer {
+        additional_info: additional_info.clone(),
+        top: *top,
+        left: *left,
+        bottom: *bottom,
+        right: *right,
+        blend_mode: *blend_mode,
+        opacity: *opacity,
+        transparency_protected: *transparency_protected,
+        effects_open: *effects_open,
+        hidden: *hidden,
+        clipping: *clipping,
+        canvas: canvas.clone(),
+        image_data: image_data.clone(),
+        raw_data: raw_data.clone(),
+        children: None,
+        opened: *opened,
+        link_group: *link_group,
+        link_group_enabled: *link_group_enabled,
     }
 }
 
@@ -1185,21 +1505,22 @@ fn bounds_or_zero(
 /// Порт `getChannels(tempBuffer, layer, background, options)`.
 ///
 /// If the layer still carries undecoded channel payloads (`Layer::raw_data`,
-/// produced by the reader under `ReadOptions::use_raw_data`), they are written
-/// back verbatim: no decode, no re-encode, and bounds are taken from the layer
-/// and its masks as-is. Otherwise the layer bitmap and masks are encoded through
-/// `temp_buffer`.
+/// produced by the reader under `ReadOptions::use_raw_data`) *at the depth the
+/// document is being written at*, they are written back verbatim: no decode, no
+/// re-encode, and bounds are taken from the layer and its masks as-is. A depth
+/// mismatch falls through to a normal encode, because the stored bytes are laid
+/// out for the depth they were read at. Otherwise the layer bitmap and masks are
+/// encoded through `temp_buffer`.
 fn get_channels(
     temp_buffer: &mut [u8],
     layer: &Layer,
     background: bool,
     options: &WriteOptions,
     psb: bool,
-    bits_per_channel: Option<f64>,
+    bit_depth: BitDepth,
 ) -> LayerChannelData {
-    let bits_per_channel = bits_per_channel.unwrap_or(8.0) as u32;
     if let Some(raw) = &layer.raw_data {
-        if raw.bits_per_channel == bits_per_channel as f64 {
+        if raw.bits_per_channel == f64::from(bit_depth.bits()) {
             // Verbatim path: `length` is recomputed (2 compression bytes + payload)
             // because the record header must match what we are about to emit.
             let channels = raw
@@ -1236,12 +1557,12 @@ fn get_channels(
     }
 
     let mut layer_data =
-        get_layer_channels(temp_buffer, layer, background, options, psb, bits_per_channel);
+        get_layer_channels(temp_buffer, layer, background, options, psb, bit_depth);
     if let Some(mask) = &layer.additional_info.mask {
-        get_mask_channels(temp_buffer, &mut layer_data, mask, options, psb, false, bits_per_channel);
+        get_mask_channels(temp_buffer, &mut layer_data, mask, options, psb, false, bit_depth);
     }
     if let Some(real_mask) = &layer.additional_info.real_mask {
-        get_mask_channels(temp_buffer, &mut layer_data, real_mask, options, psb, true, bits_per_channel);
+        get_mask_channels(temp_buffer, &mut layer_data, real_mask, options, psb, true, bit_depth);
     }
     layer_data
 }
@@ -1254,7 +1575,7 @@ fn get_mask_channels(
     options: &WriteOptions,
     psb: bool,
     real_mask: bool,
-    bits_per_channel: u32,
+    bit_depth: BitDepth,
 ) {
     let top = mask.top.unwrap_or(0.0) as i32;
     let left = mask.left.unwrap_or(0.0) as i32;
@@ -1271,17 +1592,14 @@ fn get_mask_channels(
     let right = left + width as i32;
     let bottom = top + height as i32;
 
-    let (buffer, compression): (Vec<u8>, Compression) = match image_data {
+    // An absent mask bitmap still needs a channel record; upstream emits an
+    // empty RLE payload for it.
+    let compression = selected_compression(options);
+    let (buffer, compression) = match image_data {
         None => (Vec::new(), Compression::RleCompressed),
-        Some(id) if options.compress == Some(true) => (
-            write_data_zip_without_prediction_bit_depth(id, &[0], bits_per_channel)
-                .unwrap_or_default(),
-            Compression::ZipWithoutPrediction,
-        ),
         Some(id) => (
-            write_data_rle_bit_depth(temp_buffer, id, &[0], psb, bits_per_channel)
-                .unwrap_or_default(),
-            Compression::RleCompressed,
+            encode_channel(temp_buffer, id, &[0], compression, psb, bit_depth),
+            compression,
         ),
     };
 
@@ -1334,7 +1652,7 @@ fn get_layer_channels(
     background: bool,
     options: &WriteOptions,
     psb: bool,
-    bits_per_channel: u32,
+    bit_depth: BitDepth,
 ) -> LayerChannelData {
     let mut top = layer.top.unwrap_or(0.0) as i32;
     let mut left = layer.left.unwrap_or(0.0) as i32;
@@ -1426,23 +1744,13 @@ fn get_layer_channels(
         channel_ids.insert(0, ChannelId::Transparency);
     }
 
+    let compression = selected_compression(options);
     let channels: Vec<ChannelData> = channel_ids
         .into_iter()
         .map(|channel_id| {
             let offset = offset_for_channel(channel_id, false) as usize;
-            let (buffer, compression): (Vec<u8>, Compression) = if options.compress == Some(true) {
-                (
-                    write_data_zip_without_prediction_bit_depth(&data, &[offset], bits_per_channel)
-                        .unwrap_or_default(),
-                    Compression::ZipWithoutPrediction,
-                )
-            } else {
-                (
-                    write_data_rle_bit_depth(temp_buffer, &data, &[offset], psb, bits_per_channel)
-                        .unwrap_or_default(),
-                    Compression::RleCompressed,
-                )
-            };
+            let buffer =
+                encode_channel(temp_buffer, &data, &[offset], compression, psb, bit_depth);
             let length = 2 + buffer.len();
             ChannelData { id: channel_id, compression, data: Some(buffer), length }
         })
@@ -2069,9 +2377,9 @@ mod tests {
             ..Default::default()
         });
         // 2 * 64 + 2 * 64 * 64
-        assert_eq!(get_largest_layer_size(Some(&[layer.clone()]), false, 8), 8320);
+        assert_eq!(get_largest_layer_size(Some(&[layer.clone()]), false, BitDepth::Eight), 8320);
         // PSB row lengths are 4 bytes wide: 4 * 64 + 2 * 64 * 64
-        assert_eq!(get_largest_layer_size(Some(&[layer]), true, 8), 8448);
+        assert_eq!(get_largest_layer_size(Some(&[layer]), true, BitDepth::Eight), 8448);
 
         // real_mask counts as well, and the maximum wins over the layer bitmap.
         let layer = Layer {
@@ -2086,7 +2394,7 @@ mod tests {
             ..Default::default()
         };
         // max(2*4 + 2*4*4, 2*16 + 2*32*16)
-        assert_eq!(get_largest_layer_size(Some(&[layer]), false, 8), 1056);
+        assert_eq!(get_largest_layer_size(Some(&[layer]), false, BitDepth::Eight), 1056);
 
         // The recursion into groups still applies.
         let child = Layer {
@@ -2097,10 +2405,10 @@ mod tests {
             children: Some(vec![child]),
             ..Default::default()
         };
-        assert_eq!(get_largest_layer_size(Some(&[group]), false, 8), 220);
+        assert_eq!(get_largest_layer_size(Some(&[group]), false, BitDepth::Eight), 220);
 
-        assert_eq!(get_largest_layer_size(None, false, 8), 0);
-        assert_eq!(get_largest_layer_size(None, true, 8), 0);
+        assert_eq!(get_largest_layer_size(None, false, BitDepth::Eight), 0);
+        assert_eq!(get_largest_layer_size(None, true, BitDepth::Eight), 0);
     }
 
     #[test]
@@ -2108,15 +2416,15 @@ mod tests {
         // A 1x1 PSB channel needs a 4-byte row length plus 2 bytes of encoded
         // data. Upstream's `2 * height + 2 * width * height` yields 4 and
         // truncates the channel; ours must not.
-        assert_eq!(rle_scratch_size(1, 1, 1, true, 8), 6);
-        assert_eq!(rle_scratch_size(1, 1, 1, false, 8), 4);
+        assert_eq!(rle_scratch_size(1, 1, 1, true, BitDepth::Eight), 6);
+        assert_eq!(rle_scratch_size(1, 1, 1, false, BitDepth::Eight), 4);
 
         // A 1x1 three-channel PSB composite needs 3 * (4 + 2) = 18 bytes;
         // upstream's `4 * 2 * w * h + 2 * h` yields 10.
-        assert_eq!(rle_scratch_size(1, 1, 3, true, 8), 18);
+        assert_eq!(rle_scratch_size(1, 1, 3, true, BitDepth::Eight), 18);
 
         // Saturating: an absurd bitmap must not wrap the size.
-        assert_eq!(rle_scratch_size(u32::MAX, u32::MAX, 4, true, 8), usize::MAX);
+        assert_eq!(rle_scratch_size(u32::MAX, u32::MAX, 4, true, BitDepth::Eight), usize::MAX);
     }
 
     #[test]
@@ -2283,28 +2591,27 @@ mod tests {
         };
         for depth in [16.0, 32.0] {
             for (psb, compress) in [(false, false), (true, false), (false, true)] {
-                let mut layer = Layer::default();
-                layer.top = Some(0.0);
-                layer.left = Some(0.0);
-                layer.bottom = Some(1.0);
-                layer.right = Some(4.0);
-                layer.image_data = Some(pixels.clone());
-                layer.additional_info.mask = Some(LayerMaskData {
+                let mask = || LayerMaskData {
                     top: Some(0.0),
                     left: Some(0.0),
                     bottom: Some(1.0),
                     right: Some(4.0),
                     image_data: Some(pixels.clone()),
                     ..Default::default()
-                });
-                layer.additional_info.real_mask = Some(LayerMaskData {
+                };
+                let layer = Layer {
                     top: Some(0.0),
                     left: Some(0.0),
                     bottom: Some(1.0),
                     right: Some(4.0),
                     image_data: Some(pixels.clone()),
+                    additional_info: LayerAdditionalInfo {
+                        mask: Some(mask()),
+                        real_mask: Some(mask()),
+                        ..Default::default()
+                    },
                     ..Default::default()
-                });
+                };
                 let psd = Psd {
                     width: 4.0,
                     height: 1.0,
@@ -2343,12 +2650,14 @@ mod tests {
     fn high_bit_raw_layer_channels_are_written_verbatim() {
         let pixels = gray_pattern(2, 1, |x, _| if x == 0 { 17 } else { 231 });
         for depth in [16.0, 32.0] {
-            let mut layer = Layer::default();
-            layer.top = Some(0.0);
-            layer.left = Some(0.0);
-            layer.bottom = Some(1.0);
-            layer.right = Some(2.0);
-            layer.image_data = Some(pixels.clone());
+            let layer = Layer {
+                top: Some(0.0),
+                left: Some(0.0),
+                bottom: Some(1.0),
+                right: Some(2.0),
+                image_data: Some(pixels.clone()),
+                ..Default::default()
+            };
             let psd = Psd {
                 width: 2.0,
                 height: 1.0,
@@ -2386,6 +2695,135 @@ mod tests {
                 assert_eq!(a.data, b.data);
             }
         }
+    }
+
+    #[test]
+    fn high_depth_layers_live_in_a_document_level_lr_block() {
+        let pixels = PixelData { width: 1, height: 1, data: vec![127, 64, 32, 255] };
+        let layer = Layer {
+            top: Some(0.0),
+            left: Some(0.0),
+            bottom: Some(1.0),
+            right: Some(1.0),
+            image_data: Some(pixels.clone()),
+            ..Default::default()
+        };
+
+        for &(depth, key, psb) in &[(16.0, b"Lr16", false), (32.0, b"Lr32", true)] {
+            let psd = Psd {
+                width: 1.0,
+                height: 1.0,
+                color_mode: Some(ColorMode::Rgb),
+                bits_per_channel: Some(depth),
+                image_data: Some(pixels.clone()),
+                children: Some(vec![layer.clone()]),
+                ..Default::default()
+            };
+            let bytes = write_psd(&psd, &WriteOptions { psb: Some(psb), ..Default::default() });
+
+            let position = bytes
+                .windows(4)
+                .position(|window| window == key)
+                .unwrap_or_else(|| panic!("no {} block at {} bits", String::from_utf8_lossy(key), depth));
+            // PSB carries the long-length form of the key, so the signature in
+            // front of it is 8B64 rather than 8BIM.
+            assert_eq!(&bytes[position - 4..position], if psb { b"8B64" } else { b"8BIM" });
+
+            // The ordinary layer-info section stays empty for these documents.
+            let again = read_psd(&bytes, &ReadOptions { use_image_data: Some(true), ..Default::default() })
+                .expect("read the Lr block back");
+            assert_eq!(again.bits_per_channel, Some(depth));
+            let children = again.children.as_ref().expect("children");
+            assert_eq!(children.len(), 1);
+            assert_eq!(children[0].image_data.as_ref().expect("layer bitmap").data, pixels.data);
+        }
+
+        // An 8-bit document must not grow either block.
+        let psd = Psd {
+            width: 1.0,
+            height: 1.0,
+            color_mode: Some(ColorMode::Rgb),
+            image_data: Some(pixels.clone()),
+            children: Some(vec![layer]),
+            ..Default::default()
+        };
+        let bytes = write_psd(&psd, &WriteOptions::default());
+        assert!(!bytes.windows(4).any(|w| w == b"Lr16" || w == b"Lr32"));
+    }
+
+    #[test]
+    fn deeply_nested_groups_do_not_overflow_the_stack() {
+        // A recursive walk dies on a tree this deep; the iterative one only
+        // grows the heap. The tree is built by moves (never recursively) and
+        // deliberately leaked, because `Layer`'s derived `Drop` is itself
+        // recursive and would abort the test on the way out — that limit
+        // belongs to the model in `psd.rs`, not to the writer.
+        const DEPTH: usize = 20_000;
+        let mut group = Layer {
+            additional_info: LayerAdditionalInfo {
+                name: Some("leaf".to_string()),
+                ..Default::default()
+            },
+            image_data: Some(gray_pattern(2, 2, |_, _| 9)),
+            top: Some(0.0),
+            left: Some(0.0),
+            bottom: Some(2.0),
+            right: Some(2.0),
+            ..Default::default()
+        };
+        for level in 0..DEPTH {
+            group = Layer {
+                additional_info: LayerAdditionalInfo {
+                    name: Some(format!("group {}", level)),
+                    ..Default::default()
+                },
+                children: Some(vec![group]),
+                ..Default::default()
+            };
+        }
+        let roots: &'static [Layer] = Vec::leak(vec![group]);
+
+        // The scratch estimate walks the same tree and must survive it too.
+        assert_eq!(
+            get_largest_layer_size(Some(roots), false, BitDepth::Eight),
+            rle_scratch_size(2, 2, 1, false, BitDepth::Eight)
+        );
+
+        let mut flat = Vec::new();
+        add_children(&mut flat, Some(roots));
+        // Every group contributes an opening divider and a closing record
+        // around the single leaf.
+        assert_eq!(flat.len(), DEPTH * 2 + 1);
+        assert_eq!(flat[DEPTH].additional_info.name.as_deref(), Some("leaf"));
+        // Order is preserved: openers outermost-first, closers innermost-first.
+        assert_eq!(flat[DEPTH + 1].additional_info.name.as_deref(), Some("group 0"));
+        assert_eq!(flat[DEPTH * 2].additional_info.name.as_deref(), Some("group 19999"));
+        // Group records never carry their subtree along.
+        assert!(flat.iter().all(|l| l.children.is_none()));
+    }
+
+    #[test]
+    fn add_children_preserves_sibling_and_nesting_order() {
+        let leaf = |name: &str| Layer {
+            additional_info: LayerAdditionalInfo { name: Some(name.to_string()), ..Default::default() },
+            ..Default::default()
+        };
+        let tree = vec![
+            leaf("a"),
+            Layer {
+                additional_info: LayerAdditionalInfo { name: Some("g".to_string()), ..Default::default() },
+                children: Some(vec![leaf("b"), leaf("c")]),
+                ..Default::default()
+            },
+            leaf("d"),
+        ];
+        let mut flat = Vec::new();
+        add_children(&mut flat, Some(&tree));
+        let names: Vec<_> = flat
+            .iter()
+            .map(|l| l.additional_info.name.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(names, vec!["a", "</Layer group>", "b", "c", "g", "d"]);
     }
 
     #[test]

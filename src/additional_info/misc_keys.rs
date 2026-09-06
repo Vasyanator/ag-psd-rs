@@ -16,7 +16,8 @@ PORT STATUS (см. PER-KEY ниже и REPORT в шапке коммита):
               весь `Psd`, а сюда приходит только `LayerAdditionalInfo`.
               Здесь остаётся только явная ошибка для (не встречающегося на
               практике) случая, когда такая секция вложена в СЛОЙ.
-              Write — no-op, как в upstream (предикат `() => false`).
+              Write — выполняется document-level оркестрацией в `writer.rs`
+              (`write_high_depth_layer_info`), а не этим handler-ом.
 - SKIP/RAW-STUB (с причиной — см. соответствующую функцию):
     `shmd`  — пишущая сторона требует layerToId + serializeEffects/serializeTrackList
               (оркестрация документа и effects/timeline-сериализаторы не портированы);
@@ -426,8 +427,10 @@ pub fn has(key: &str, info: &LayerAdditionalInfo) -> Option<bool> {
         // section we cannot fill. NOTE: shmd write unported.
         "shmd" => false,
 
-        // Lr16/Lr32: upstream predicate is `() => false` (never written
-        // directly here; emitted by the document orchestration). false.
+        // Lr16/Lr32 are document-level high-depth layer sections: their payload
+        // is the whole layer-info body, not a layer-owned additional-info
+        // record, so `writer::write_high_depth_layer_info` emits them and this
+        // predicate stays false (as upstream's `() => false`).
         "Lr16" | "Lr32" => false,
 
         // artd/Anno: document-level (`Psd.artboards` / `Psd.annotations`) — not

@@ -6,6 +6,17 @@ Purpose:
 <-> 4-символьный ключ, layerColors, упаковка/распаковка данных каналов
 (raw / RLE / zip-without-prediction), а также заглушки canvas-уровня.
 
+Channel bit depths:
+The `*_bit_depth` writers (`write_data_raw_bit_depth`, `write_data_rle_bit_depth`,
+`write_data_zip_without_prediction_bit_depth`) expand the crate's RGBA8 model to
+the 8/16/32-bit big-endian samples a PSD channel stores; `expand_channel_samples`
+is the single place that mapping lives. `write_data_rle_bit_depth` reports
+unrepresentable input as a typed `RleEncodeError` instead of emitting a shorter,
+silently corrupt channel, and its high-depth path allocates its own exactly
+sized output rather than borrowing the shared writer scratch buffer.
+ZIP output is always zlib-wrapped, matching upstream's pako `deflate`; the
+reader (`reader::inflate_channel_stream`) additionally tolerates bare DEFLATE.
+
 Source compatibility:
 - порт upstream-файла `test/ag-psd/src/helpers.ts` (разбиение 1:1).
 
@@ -442,8 +453,19 @@ pub fn decode_bitmap(input: &[u8], output: &mut [u8], width: usize, height: usiz
 
 /// upstream `writeDataRaw(data, offset, width, height)`.
 /// Извлекает один канал (по offset) в плотный массив длиной width*height.
+///
+/// `offset` is the channel's byte index inside each RGBA quadruple (`0..=3`).
+/// Returns `None` for an empty bitmap or when `data.data` is shorter than
+/// `width * height * 4`; upstream reads past the end of its typed array and
+/// gets zeros, but an out-of-range index panics in Rust, so the caller is told
+/// instead (crate contract: a public API never panics on a bad buffer length).
+#[must_use]
 pub fn write_data_raw(data: &PixelData, offset: usize, width: usize, height: usize) -> Option<Vec<u8>> {
-    if width == 0 || height == 0 {
+    if width == 0 || height == 0 || offset >= 4 {
+        return None;
+    }
+    let needed = width.checked_mul(height)?.checked_mul(4)?;
+    if data.data.len() < needed {
         return None;
     }
     let mut array = vec![0u8; width * height];
@@ -453,8 +475,35 @@ pub fn write_data_raw(data: &PixelData, offset: usize, width: usize, height: usi
     Some(array)
 }
 
-/// Expands RGBA8 channel samples into the byte representation required by an
-/// RGB PSD/PSB channel at the requested bit depth.
+/// Bytes one channel sample occupies in the file at `bit_depth`.
+///
+/// `bit_depth` is a PSD channel depth in bits; only 8, 16 and 32 exist for the
+/// RGB modes this crate writes, and anything else returns `None` rather than
+/// guessing a width.
+#[must_use]
+pub fn bytes_per_sample(bit_depth: u32) -> Option<usize> {
+    match bit_depth {
+        8 => Some(1),
+        16 => Some(2),
+        32 => Some(4),
+        _ => None,
+    }
+}
+
+/// Expands RGBA8 channel samples into the byte representation an RGB PSD/PSB
+/// channel uses at `bit_depth`.
+///
+/// `samples` holds one byte per pixel, `0..=255`. The returned buffer is
+/// big-endian and `samples.len() * bytes_per_sample(bit_depth)` bytes long:
+///
+/// - 8 bits — the samples verbatim;
+/// - 16 bits — `sample * 257`, which maps `0..=255` onto the full `0..=65535`
+///   range with `0xff` becoming `0xffff` rather than `0xff00`;
+/// - 32 bits — `sample / 255.0` as an IEEE-754 `f32` in `0.0..=1.0`, the
+///   normalized form Photoshop stores for 32-bit documents.
+///
+/// Returns `None` if `bit_depth` is not 8, 16 or 32.
+#[must_use]
 pub fn expand_channel_samples(samples: &[u8], bit_depth: u32) -> Option<Vec<u8>> {
     match bit_depth {
         8 => Some(samples.to_vec()),
@@ -467,6 +516,7 @@ pub fn expand_channel_samples(samples: &[u8], bit_depth: u32) -> Option<Vec<u8>>
         32 => Some(
             samples
                 .iter()
+                // u8 -> f32 is exact, so the division is the only rounding step.
                 .flat_map(|&sample| (f32::from(sample) / 255.0).to_be_bytes())
                 .collect(),
         ),
@@ -474,7 +524,15 @@ pub fn expand_channel_samples(samples: &[u8], bit_depth: u32) -> Option<Vec<u8>>
     }
 }
 
-/// Extracts one RGBA8 channel and expands it to a raw PSD channel payload.
+/// Extracts one RGBA8 channel and expands it to an uncompressed PSD channel
+/// payload at `bit_depth`.
+///
+/// `offset` is the byte index of the channel inside each RGBA quadruple
+/// (`0..=3`), `width` x `height` the bitmap size in pixels. Returns
+/// `width * height * bytes_per_sample(bit_depth)` big-endian bytes, or `None`
+/// for an empty bitmap, an unsupported `bit_depth`, or a `data` buffer too
+/// short for the declared size (see [`write_data_raw`]).
+#[must_use]
 pub fn write_data_raw_bit_depth(
     data: &PixelData,
     offset: usize,
@@ -645,98 +703,222 @@ pub fn write_data_rle(
     Some(buffer[..end].to_vec())
 }
 
-/// Writes channel data using PackBits after expanding RGBA8 samples to the
-/// requested PSD bit depth. The row-length table stores encoded byte lengths.
+/// Why [`write_data_rle_bit_depth`] could not produce a valid PackBits channel.
+///
+/// Every variant describes input the PSD/PSB container cannot represent, so a
+/// caller must reject the document rather than emit a shorter channel: an
+/// undersized channel is structurally valid and silently corrupt, which is the
+/// failure mode this type exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RleEncodeError {
+    /// `bit_depth` was not one of the PSD channel depths 8, 16 or 32.
+    UnsupportedBitDepth {
+        /// The rejected depth, in bits.
+        bit_depth: u32,
+    },
+    /// The bitmap has a zero side, no channel offsets were given, an offset is
+    /// not a valid RGBA component index (`0..=3`), or `data` is shorter than
+    /// `width * height * 4` bytes.
+    InvalidBitmap {
+        /// Bitmap width in pixels.
+        width: usize,
+        /// Bitmap height in pixels.
+        height: usize,
+        /// Number of channel offsets requested.
+        channels: usize,
+        /// Length of the RGBA8 source buffer, in bytes.
+        data_len: usize,
+    },
+    /// One compressed row is longer than its row-length table entry can
+    /// address. PSD stores that entry in two bytes (65535 max) and PSB in four,
+    /// so a wide 32-bit bitmap can overflow the PSD form; writing it as PSB is
+    /// the fix.
+    RowLengthOverflow {
+        /// Zero-based row index inside the channel.
+        row: usize,
+        /// Length of the PackBits-compressed row, in bytes.
+        encoded_len: usize,
+        /// Largest value the row-length entry can hold, in bytes.
+        max_len: usize,
+    },
+}
+
+impl std::fmt::Display for RleEncodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RleEncodeError::UnsupportedBitDepth { bit_depth } => {
+                write!(f, "Unsupported channel bit depth: {} (expected 8, 16 or 32)", bit_depth)
+            }
+            RleEncodeError::InvalidBitmap { width, height, channels, data_len } => write!(
+                f,
+                "Invalid bitmap for RLE encoding: {}x{}, {} channel offset(s), {} bytes of RGBA8 data",
+                width, height, channels, data_len
+            ),
+            RleEncodeError::RowLengthOverflow { row, encoded_len, max_len } => write!(
+                f,
+                "Compressed row {} is {} bytes, more than the {} a row-length entry can address \
+                 (use the PSB format for bitmaps this wide)",
+                row, encoded_len, max_len
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RleEncodeError {}
+
+/// Compresses one or more channels with PackBits after expanding RGBA8 samples
+/// to `bit_depth`, mirroring the layout [`write_data_rle`] produces for 8-bit
+/// data: a per-row length table for every channel first, then the rows.
+///
+/// `offsets` lists the channels to encode as byte indices inside each RGBA
+/// quadruple (`0..=3`). `large` selects the PSB row-length entry width (4
+/// bytes, against 2 for PSD). `bit_depth` is a PSD channel depth in bits and
+/// must be 8, 16 or 32.
+///
+/// `buffer` is the shared writer scratch buffer and is used *only* for the
+/// 8-bit path, which delegates to [`write_data_rle`]; the high-depth path
+/// allocates its own exactly-sized output, so it is never truncated by a short
+/// scratch buffer. Sizing for the 8-bit path is `writer::rle_scratch_size`.
+///
+/// # Errors
+/// [`RleEncodeError`] — see that type; every variant means the document cannot
+/// be written faithfully, never that a shorter result was produced.
 pub fn write_data_rle_bit_depth(
     buffer: &mut [u8],
     data_pixels: &PixelData,
     offsets: &[usize],
     large: bool,
     bit_depth: u32,
-) -> Option<Vec<u8>> {
-    if bit_depth == 8 {
-        return write_data_rle(buffer, data_pixels, offsets, large);
-    }
+) -> Result<Vec<u8>, RleEncodeError> {
     let width = data_pixels.width as usize;
     let height = data_pixels.height as usize;
-    if width == 0 || height == 0 || offsets.is_empty() {
-        return None;
-    }
-    let bytes_per_sample = match bit_depth {
-        16 => 2,
-        32 => 4,
-        _ => return None,
+    let invalid = || RleEncodeError::InvalidBitmap {
+        width,
+        height,
+        channels: offsets.len(),
+        data_len: data_pixels.data.len(),
     };
+
+    if bit_depth == 8 {
+        return write_data_rle(buffer, data_pixels, offsets, large).ok_or_else(invalid);
+    }
+    let sample_bytes = bytes_per_sample(bit_depth)
+        .ok_or(RleEncodeError::UnsupportedBitDepth { bit_depth })?;
+
+    let pixels = width
+        .checked_mul(height)
+        .filter(|&pixels| pixels != 0)
+        .ok_or_else(invalid)?;
+    if offsets.is_empty()
+        || offsets.iter().any(|&offset| offset >= 4)
+        || data_pixels.data.len() < pixels * 4
+    {
+        return Err(invalid());
+    }
+
+    // The row-length entry is written before the row it measures, so the whole
+    // table is reserved up front and filled in as the rows are compressed.
     let entry_size = if large { 4 } else { 2 };
-    let table_size = offsets.len() * height * entry_size;
-    let mut output = vec![0u8; table_size];
+    // Both supported targets are 64-bit, so `u32::MAX` fits `usize`; `try_from`
+    // keeps the bound honest on any other target instead of truncating it.
+    let max_row_len = if large {
+        usize::try_from(u32::MAX).unwrap_or(usize::MAX)
+    } else {
+        usize::from(u16::MAX)
+    };
+    let mut output = vec![0u8; offsets.len() * height * entry_size];
     let mut table_offset = 0usize;
+
     for &offset in offsets {
-        let mut channel = Vec::with_capacity(width * height);
-        for pixel in 0..width * height {
-            channel.push(data_pixels.data[pixel * 4 + offset]);
-        }
-        let expanded = expand_channel_samples(&channel, bit_depth)?;
+        let channel: Vec<u8> = (0..pixels).map(|pixel| data_pixels.data[pixel * 4 + offset]).collect();
+        let expanded = expand_channel_samples(&channel, bit_depth)
+            .ok_or(RleEncodeError::UnsupportedBitDepth { bit_depth })?;
+
         for row in 0..height {
-            let row_start = row * width * bytes_per_sample;
-            let row_end = row_start + width * bytes_per_sample;
-            let encoded = packbits_encode(&expanded[row_start..row_end]);
-            let length = encoded.len();
-            if large {
-                if table_offset + 4 <= output.len() {
-                    output[table_offset..table_offset + 4]
-                        .copy_from_slice(&(length as u32).to_be_bytes());
-                }
-                table_offset += 4;
-            } else {
-                if table_offset + 2 <= output.len() {
-                    output[table_offset..table_offset + 2]
-                        .copy_from_slice(&(length as u16).to_be_bytes());
-                }
-                table_offset += 2;
+            let row_start = row * width * sample_bytes;
+            let encoded = packbits_encode(&expanded[row_start..row_start + width * sample_bytes]);
+            if encoded.len() > max_row_len {
+                return Err(RleEncodeError::RowLengthOverflow {
+                    row,
+                    encoded_len: encoded.len(),
+                    max_len: max_row_len,
+                });
             }
+            // The overflow check above proves both conversions are exact.
+            let entry = &mut output[table_offset..table_offset + entry_size];
+            if large {
+                entry.copy_from_slice(&(encoded.len() as u32).to_be_bytes());
+            } else {
+                entry.copy_from_slice(&(encoded.len() as u16).to_be_bytes());
+            }
+            table_offset += entry_size;
             output.extend_from_slice(&encoded);
         }
     }
-    let copy_len = output.len().min(buffer.len());
-    buffer[..copy_len].copy_from_slice(&output[..copy_len]);
-    Some(output[..copy_len].to_vec())
+    Ok(output)
 }
 
+/// PackBits-compresses one row of bytes.
+///
+/// Emits Photoshop's byte-oriented variant: a header byte of `0..=127` starts a
+/// literal run of `header + 1` bytes, `129..=255` a repeat of the next byte
+/// `257 - header` times, and `128` is never produced (decoders treat it as a
+/// no-op). Both run kinds are capped at 128 bytes, so the result never exceeds
+/// `row.len() + row.len() / 128 + 1` bytes.
 fn packbits_encode(row: &[u8]) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(row.len() + row.len() / 128 + 1);
+    /// Longest run or literal a single PackBits header byte can describe.
+    const MAX_RUN: usize = 128;
+
+    let mut encoded = Vec::with_capacity(row.len() + row.len() / MAX_RUN + 1);
     let mut i = 0usize;
     while i < row.len() {
-        let mut run = 1usize;
-        while i + run < row.len() && row[i + run] == row[i] && run < 128 {
-            run += 1;
-        }
+        let run = repeat_len(row, i, MAX_RUN);
         if run >= 3 {
-            encoded.push((1i16 - run as i16) as u8);
+            // `run` is 3..=128, so `1 - run` is -127..=-2: the two's-complement
+            // byte is 129..=254 and can never collide with the 128 no-op.
+            encoded.push(1u8.wrapping_sub(run_as_u8(run)));
             encoded.push(row[i]);
             i += run;
             continue;
         }
+
+        // Literal run: keep taking bytes until a run of three or more starts,
+        // the row ends, or the 128-byte header limit is reached. The limit is
+        // checked against the *next* step's length, because overshooting it
+        // would emit a header of 128, which decoders read as a no-op.
         let literal_start = i;
         i += run;
-        while i < row.len() && i - literal_start < 128 {
-            let mut next_run = 1usize;
-            while i + next_run < row.len()
-                && row[i + next_run] == row[i]
-                && next_run < 128
-            {
-                next_run += 1;
-            }
-            if next_run >= 3 {
+        while i < row.len() {
+            let next_run = repeat_len(row, i, MAX_RUN);
+            if next_run >= 3 || i - literal_start + next_run > MAX_RUN {
                 break;
             }
             i += next_run;
         }
         let literal_len = i - literal_start;
-        encoded.push((literal_len - 1) as u8);
+        encoded.push(run_as_u8(literal_len) - 1);
         encoded.extend_from_slice(&row[literal_start..i]);
     }
     encoded
+}
+
+/// Length of the run of equal bytes starting at `start`, capped at `max`.
+fn repeat_len(row: &[u8], start: usize, max: usize) -> usize {
+    let value = row[start];
+    let mut len = 1usize;
+    while len < max && start + len < row.len() && row[start + len] == value {
+        len += 1;
+    }
+    len
+}
+
+/// Narrows a PackBits run length to `u8`.
+///
+/// `packbits_encode` caps every run at 128 before calling this, so the value
+/// always fits; the saturating fallback exists only so the conversion cannot
+/// panic or wrap if that invariant is ever broken by a later edit.
+fn run_as_u8(len: usize) -> u8 {
+    u8::try_from(len).unwrap_or(u8::MAX)
 }
 
 /// upstream `writeDataZipWithoutPrediction({ data, width, height }, offsets)`.
@@ -772,8 +954,18 @@ pub fn write_data_zip_without_prediction(data_pixels: &PixelData, offsets: &[usi
     }
 }
 
-/// Encodes channels with ZIP (zlib-wrapped deflate) after expanding RGBA8
-/// samples to a PSD channel bit depth.
+/// Encodes channels with ZIP (zlib-wrapped deflate, matching upstream's `pako`
+/// `deflate`) after expanding RGBA8 samples to `bit_depth`.
+///
+/// `offsets` lists the channels as byte indices inside each RGBA quadruple
+/// (`0..=3`); the compressed channels are concatenated in that order, with no
+/// per-channel length table — the enclosing record supplies the lengths.
+/// `bit_depth` is a PSD channel depth in bits and must be 8, 16 or 32.
+///
+/// Returns `None` for an unsupported `bit_depth`, an empty bitmap or channel
+/// list, an offset outside `0..=3`, or a `data` buffer shorter than
+/// `width * height * 4`.
+#[must_use]
 pub fn write_data_zip_without_prediction_bit_depth(
     data_pixels: &PixelData,
     offsets: &[usize],
@@ -782,8 +974,13 @@ pub fn write_data_zip_without_prediction_bit_depth(
     if bit_depth == 8 {
         return write_data_zip_without_prediction(data_pixels, offsets);
     }
-    let size = (data_pixels.width as usize) * (data_pixels.height as usize);
-    if size == 0 || offsets.is_empty() {
+    bytes_per_sample(bit_depth)?;
+    let size = (data_pixels.width as usize).checked_mul(data_pixels.height as usize)?;
+    if size == 0
+        || offsets.is_empty()
+        || offsets.iter().any(|&offset| offset >= 4)
+        || data_pixels.data.len() < size.checked_mul(4)?
+    {
         return None;
     }
     let mut buffers = Vec::with_capacity(offsets.len());
@@ -1018,11 +1215,92 @@ mod tests {
             data: vec![1, 2, 3, 4, 255, 6, 7, 8],
         };
         assert_eq!(write_data_raw_bit_depth(&pd, 0, 2, 1, 16), Some(vec![1, 1, 255, 255]));
+
+        // The ZIP channel writer emits zlib-wrapped deflate, exactly like
+        // upstream's `pako` `deflate` — decoding it as raw DEFLATE must fail.
         let compressed = write_data_zip_without_prediction_bit_depth(&pd, &[0], 32).unwrap();
-        let mut decoder = flate2::read::DeflateDecoder::new(&compressed[..]);
+        let mut decoder = flate2::read::ZlibDecoder::new(&compressed[..]);
         let mut decoded = Vec::new();
         std::io::Read::read_to_end(&mut decoder, &mut decoded).unwrap();
         assert_eq!(decoded, [1.0f32 / 255.0, 1.0].into_iter().flat_map(f32::to_be_bytes).collect::<Vec<_>>());
+
+        // Rejected inputs, rather than a silently shorter channel.
+        assert_eq!(write_data_zip_without_prediction_bit_depth(&pd, &[0], 12), None);
+        assert_eq!(write_data_zip_without_prediction_bit_depth(&pd, &[], 16), None);
+        assert_eq!(write_data_zip_without_prediction_bit_depth(&pd, &[4], 16), None);
+        assert_eq!(write_data_raw_bit_depth(&pd, 0, 3, 1, 16), None);
+    }
+
+    #[test]
+    fn packbits_never_emits_the_no_op_header() {
+        // A 200-byte literal stretch with no run of three: the encoder must
+        // split it into two literals of at most 128 bytes each and never emit
+        // header 128, which decoders skip.
+        let row: Vec<u8> = (0..200u16).map(|i| if i % 2 == 0 { 0 } else { 1 }).collect();
+        let encoded = packbits_encode(&row);
+        assert!(!encoded.is_empty());
+        assert_eq!(encoded[0], 127, "first literal must be capped at 128 bytes");
+        assert_eq!(encoded[129], 71, "remaining 72 bytes form the second literal");
+        assert_eq!(encoded.len(), 202);
+
+        // Runs longer than 128 are split too, and a run header is 129..=254.
+        let encoded = packbits_encode(&[7u8; 300]);
+        assert_eq!(encoded, vec![129, 7, 129, 7, 213, 7]);
+
+        // Round trip through the reader's decoder for a mixed row.
+        let row = [1u8, 1, 1, 1, 2, 3, 4, 4, 4, 4, 4, 9];
+        assert_eq!(
+            crate::reader::decode_packbits_row(&packbits_encode(&row), row.len()),
+            row.to_vec()
+        );
+    }
+
+    #[test]
+    fn rle_bit_depth_reports_input_it_cannot_encode() {
+        let pd = PixelData { width: 2, height: 1, data: vec![1, 2, 3, 4, 255, 6, 7, 8] };
+        let mut scratch = [0u8; 64];
+
+        assert_eq!(
+            write_data_rle_bit_depth(&mut scratch, &pd, &[0], false, 12),
+            Err(RleEncodeError::UnsupportedBitDepth { bit_depth: 12 })
+        );
+        assert!(matches!(
+            write_data_rle_bit_depth(&mut scratch, &pd, &[], false, 16),
+            Err(RleEncodeError::InvalidBitmap { .. })
+        ));
+        assert!(matches!(
+            write_data_rle_bit_depth(&mut scratch, &pd, &[4], false, 16),
+            Err(RleEncodeError::InvalidBitmap { .. })
+        ));
+
+        // A short scratch buffer must NOT truncate the high-depth result: the
+        // encoder allocates its own exactly-sized output. `writer.rs` relies on
+        // exactly this to size the shared scratch buffer for 8-bit only
+        // (`SCRATCH_DEPTH`), so this assertion guards that decision too.
+        let mut tiny = [0u8; 1];
+        let full = write_data_rle_bit_depth(&mut scratch, &pd, &[0], false, 16).unwrap();
+        assert_eq!(write_data_rle_bit_depth(&mut tiny, &pd, &[0], false, 16).unwrap(), full);
+        // Two-byte row length table + the PackBits form of [1, 1, 255, 255].
+        assert_eq!(full.len(), 2 + 5);
+        assert_eq!(&full[..2], &[0, 5]);
+
+        // A row too long for a PSD row-length entry is an error, not a
+        // truncated channel; the same bitmap encodes fine as PSB.
+        const WIDE: u32 = 40000;
+        let wide = PixelData {
+            width: WIDE,
+            height: 1,
+            // Cycling samples defeat run compression, so the encoded row is
+            // longer than the 65535 a PSD row-length entry can address.
+            data: (0..WIDE)
+                .flat_map(|x| [u8::try_from(x % 251).unwrap_or(0), 0, 0, 255])
+                .collect(),
+        };
+        assert!(matches!(
+            write_data_rle_bit_depth(&mut scratch, &wide, &[0], false, 16),
+            Err(RleEncodeError::RowLengthOverflow { row: 0, .. })
+        ));
+        assert!(write_data_rle_bit_depth(&mut scratch, &wide, &[0], true, 16).is_ok());
     }
 
     #[test]
